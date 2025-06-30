@@ -1,0 +1,1854 @@
+---
+title: "scRNAseq_analysis_EDB001"
+author: "Daria"
+date: "2025-03-08"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.width=8, fig.height=6) 
+knitr::opts_chunk$set(cache = TRUE, cache.lazy = FALSE)
+```
+
+## Setup
+
+
+
+```{r libs , echo=FALSE, message=FALSE, cache = FALSE}
+#BiocManager::install(version = "3.18")
+#remotes::install_github("satijalab/seurat", "seurat5", quiet = TRUE)
+#remotes::install_github("satijalab/seurat-data", "seurat5", quiet = TRUE)
+#BiocManager::install("BSgenome.Hsapiens.UCSC.hg38")
+#remotes::install_github('satijalab/azimuth', ref = 'master',quiet = TRUE)
+#BiocManager::install("TFBSTools", type = "source", force = TRUE)
+#remotes::install_github("10xGenomics/loupeR")
+#devtools::install_github("karthik/wesanderson")
+#loupeR::setup()
+library(tidyr)
+library(dplyr)
+library(readxl)
+library(clusterProfiler)
+library(ggplot2)
+library(pheatmap)
+library(Seurat)
+library(tidyverse)
+library(Azimuth)
+library(loupeR)
+library("wesanderson")
+
+#library(loupeR)
+#library(clustree)
+theme_set(theme_bw(base_size = 14))
+writeLines(capture.output(sessionInfo()), "sessionInfo.txt")
+```
+
+## Load data from VIB Single Cell Core
+
+### EDB001_reseq
+
+Notes from the meeting with Niels: reseq folder contain shallow seq and reseq; this is also the input for the surat object
+EDB001_Hashing_Reseq = > the cell hashtags were re-sequenced
+In the reseq experiment, the HTO Demux worked and the additional population is not present any more in the Hashtag4 cells.
+
+https://www.single-cell.be/data-explorer/browser/316573e2-576c-4d2f-b4de-d6ed4a7fc6a6
+
+### EDB001
+
+Notes: this link was provided to us in the email and here Niels found the additional population in Hashtag4 (M5KO tumor), that also
+overlaps with Negative demuliplexing "cells" (i.e. no RNA) and cellranger matrix "raw" cells (i.e. the ones suggested to not retain by filtering).
+HTO Demux failed in this experiment!
+
+https://www.single-cell.be/data-explorer/browser/154d0557-7b85-4ebf-a9fe-5767b9c376be
+
+## Load EDB001_reseq data and summarize the object content
+
+```{r input, message=FALSE}
+# Import object
+data <- readRDS(file = "EDB001_reseq_seurat.rds")
+data
+colnames(data@meta.data)
+#head(data)
+
+# View cell identities, get summary table
+table(Idents(data))
+
+# what is the identity corresponding to?
+
+# Stash cell identity classes in metadata
+data[["SCcore.ident"]] <- Idents(object = data)
+#data <- StashIdent(object = data, save.name = "old.ident")
+
+all(data$SCcore.ident == data$seurat_clusters)
+all(data$SCcore.ident == data$RNA_clusters)
+all(as.character(data$seurat_clusters) == as.character(data$RNA_clusters))
+all(as.character(data$SCcore.ident) == as.character(data$orig.ident))
+
+# Set identity back to original
+Idents(data) <- data$orig.ident
+table(Idents(data))
+
+
+```
+
+## To do
+1. plot consensusu between Demux and MultiSeq:
+HTODemux.ID
+MultiSeq.ID
+2. Make a conservative choice to only include cells with agreemend on hashtag
+3. select only human cells
+4. plot QC measures to see if we need to make cutoffs to remove lowest scoring cells (for now do not remove enything)
+5. Rely on previous normalization: By default, we employ a global-scaling normalization method “LogNormalize” that normalizes the feature expression measurements for each cell by the total expression, multiplies this by a scale factor (10,000 by default), and log-transforms the result. In Seurat v5, Normalized values are stored in data[["RNA"]]$data
+pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize", scale.factor = 10000)
+6. New UMAP and clustering (after filtering)
+7. Cluster annotatiuon and differential expression analysis
+
+## standard functions
+pbmc <- NormalizeData(object = pbmc)
+
+pbmc <- FindVariableFeatures(object = pbmc)
+
+pbmc <- ScaleData(object = pbmc)
+
+pbmc <- RunPCA(object = pbmc)
+
+pbmc <- FindNeighbors(object = pbmc, dims = 1:30)
+
+pbmc <- FindClusters(object = pbmc)
+
+pbmc <- RunUMAP(object = pbmc, dims = 1:30)
+
+DimPlot(object = pbmc, reduction = "umap")
+
+https://satijalab.org/seurat/articles/essential_commands.html
+
+https://satijalab.org/seurat/articles/pbmc3k_tutorial
+
+## QC and selecting cells for further analysis
+nCount_RNA the total number of reads (or more correctly UMIs) in the dataset
+
+nFeature_RNA the number of observed genes (anything with a nonzero count)
+
+Typically QC metrics are:
+The number of unique genes detected in each cell.
+Low-quality cells or empty droplets will often have very few genes
+Cell doublets or multiplets may exhibit an aberrantly high gene count
+Similarly, the total number of molecules detected within a cell (correlates strongly with unique genes)
+The percentage of reads that map to the mitochondrial genome
+Low-quality / dying cells often exhibit extensive mitochondrial contamination
+We calculate mitochondrial QC metrics with the PercentageFeatureSet() function, which calculates the percentage of counts originating from a set of features
+We use the set of all genes starting with MT- as a set of mitochondrial genes
+```{r qc}
+# mito gene counts were added by SC core
+# while in the mouse genome annotation mitochondrial genes have names that start with mt- (lowercase), in the human annotation mitochondrial genes start with MT- (uppercase)
+
+data[["percent.Hs.mito"]] <- PercentageFeatureSet(data, pattern = "^GRCh38-MT-")
+data[["percent.Mm.mito"]] <- PercentageFeatureSet(data, pattern = "^mm10---mt-")
+data[["percent.any.mito"]] <- PercentageFeatureSet(data, pattern = "^GRCh38-MT-|^mm10---mt-")
+all(data[["percent.any.mito"]] == data[["percent.mito"]])
+
+# Visualize QC metrics as a violin plot
+VlnPlot(data, features = c("nFeature_RNA", "nCount_RNA", "percent.mito"), ncol = 3, alpha = 0.1)
+```
+
+## Plot consensusus between Demux and MultiSeq:
+HTODemux.ID
+MultiSeq.ID
+
+```{r demultiplex}
+compar_demulti = as.data.frame(table(paste (data$HTODemux.ID, data$MultiSeq.ID))) 
+colnames(compar_demulti) = c("combi", "cells")
+compar_demulti$HTODemux.ID = str_split_fixed(compar_demulti$combi, " ",2)[,1]
+compar_demulti$MultiSeq.ID = str_split_fixed(compar_demulti$combi, " ",2)[,2]
+
+compar_demulti %>%
+  group_by(HTODemux.ID) %>%
+  mutate(HTODemux.ID_total_per_group = sum(cells)) ->compar_demulti
+
+compar_demulti$percent.HTODemux = 100 * compar_demulti$cells / compar_demulti$HTODemux.ID_total_per_group
+
+ggplot(data = compar_demulti, aes(x=HTODemux.ID, y = MultiSeq.ID, size = cells, color = percent.HTODemux)) +
+  geom_point()+
+  scale_color_gradient(low = "red", high = "blue")+
+  ggtitle("agreement in demultiplexing")+
+  geom_text(aes(label = round(percent.HTODemux, 2)), nudge_y = 0.4)+
+  labs(color = "percent\ncells\nper HTODemux.ID")
+
+# use consensus as demultiplexing strategy and assign condition to the corresponding hashtag
+data$consensus_demulti = ifelse(data$HTODemux.ID == data$MultiSeq.ID, as.character(data$HTODemux.ID), "disagreement")
+data$condition <- data$consensus_demulti
+data$condition = gsub("Hashtag1", "Mock_Blood",data$condition)
+data$condition = gsub("Hashtag2", "Mock_Tumor",data$condition)
+data$condition = gsub("Hashtag3", "M5KO_Blood",data$condition)
+data$condition = gsub("Hashtag4", "M5KO_Tumor",data$condition)
+
+data$condition = factor(data$condition, levels = c("Mock_Blood","M5KO_Blood","Mock_Tumor", "M5KO_Tumor", "Negative", "Doublet", "disagreement"))
+
+```
+
+
+## Find mouse cells
+Calculate the percentage of all counts that belong to a given set of features
+```{r find_mouse}
+#
+data[["percent.mouse"]] <- PercentageFeatureSet(data, pattern = "^mm10-")
+
+Idents(data) <- data$condition
+
+VlnPlot(data, features = c("percent.mouse","nFeature_RNA", "nCount_RNA", "percent.mito"), ncol = 4, alpha = 0.1)
+
+Idents(data) <- data$seurat_clusters
+
+# Mouse cell clusters are 6, 9, 12, 16, 17, 18
+VlnPlot(data, features = c("percent.mouse", "nFeature_RNA"), ncol=1, alpha = 0.1)
+VlnPlot(data, features = c("nCount_RNA", "percent.mito"), ncol=1, alpha = 0.1)
+
+ggplot(data = data@meta.data, aes(x = percent.mouse)) +
+  geom_density()+
+  scale_x_continuous(breaks = seq(0, 100, by = 5))+
+  geom_vline(xintercept = 10, color = "red", linetype = "dashed")+
+  ggtitle("Threshold maximal 10% mouse gene count per cell.")
+
+data[["mouse"]] <- ((data$percent.mouse > 10) | (data$seurat_clusters %in% c("6", "9","12", "16", "17", "18" )))
+
+
+
+```
+
+## Visualize non-linear dimensionality reduction
+Overlap the clusters with mouse gene expression and decide on mouse filtering
+```{r umap}
+DimPlot(data, reduction = "RNA_umap", label = TRUE)
+DimPlot(data, reduction = "RNA_umap", group.by = "mouse", alpha = 0.5) #RNA_pca RNA_tsne RNA_umap
+```
+
+
+## Plot clusters for the different conditions before filtering
+
+
+```{r before_filt}
+DimPlot(data, reduction = "RNA_umap", group.by = "condition", alpha = 0.5)
+DimPlot(data, reduction = "RNA_umap", label = TRUE, split.by = "condition", ncol = 3)
+
+data0 = subset(x = data, subset =condition %in% c("Mock_Tumor", "M5KO_Tumor"))
+DimPlot(data0,
+        reduction = "RNA_umap", label = TRUE, split.by = "condition", ncol = 2)
+DimPlot(data0,
+        reduction = "RNA_umap", label = TRUE, group.by = "source_matrix", split.by = "condition", ncol = 2)
+rm(data0)
+
+data0 = subset(x = data, subset =condition %in% c("Mock_Blood", "M5KO_Blood"))
+DimPlot(data0,
+        reduction = "RNA_umap", label = TRUE, split.by = "condition", ncol = 2)
+DimPlot(data0,
+        reduction = "RNA_umap", label = TRUE, group.by = "source_matrix", split.by = "condition", ncol = 2)
+rm(data0)
+
+#this cluster 2 data visible in the SC core report is not there anymore? (CreateSeuratObject )
+#min.cells.threshold   : num 3
+#  .. .. .. ..$ min.Features.threshold: num 200
+#  .. .. .. ..$ nFeatures             : int 34606
+#  .. .. .. ..$ nCells                : int 18793
+#  $ mito.drop        : int 256
+#  .. .. .. .. ..$ total.drop       : int 256
+#  .. .. .. .. ..$ nCells           : int 18537
+#  .. .. .. .. ..$ nFeatures        : int 3460
+
+```
+
+
+
+## Filter out mouse cells and keep only concensus demultiplexed samples
+```{r filter}
+# Subset on a value in the object meta data
+
+data1 = subset(x = data, subset = mouse == FALSE & condition %in% c("Mock_Blood","M5KO_Blood","Mock_Tumor", "M5KO_Tumor"))
+table(data1$condition)
+data1$condition = factor(data1$condition, levels = c("Mock_Blood","M5KO_Blood","Mock_Tumor", "M5KO_Tumor") )
+Idents(data1) <- data1$condition
+table(data1$condition)
+
+data1$seurat_clusters = factor(data1$seurat_clusters, levels = as.character(sort(unique(data1$seurat_clusters))) )
+```
+
+
+## Plot QC after filering
+
+## Plot clusters for the different conditions after filtering
+
+
+```{r after_filt_umap}
+data0 = subset(x = data1, subset =condition %in% c("Mock_Tumor", "M5KO_Tumor"))
+Idents(data0) <- data0$seurat_clusters
+DimPlot(data0,
+        reduction = "RNA_umap", label = TRUE, split.by = "condition", ncol = 2)
+DimPlot(data0,
+        reduction = "RNA_umap", label = TRUE, group.by = "source_matrix", split.by = "condition", ncol = 2)
+rm(data0)
+
+data0 = subset(x = data1, subset =condition %in% c("Mock_Blood", "M5KO_Blood"))
+Idents(data0) <- data0$seurat_clusters
+DimPlot(data0,
+        reduction = "RNA_umap", label = TRUE, split.by = "condition", ncol = 2)
+DimPlot(data0,
+        reduction = "RNA_umap", label = TRUE, group.by = "source_matrix", split.by = "condition", ncol = 2)
+rm(data0)
+
+
+```
+
+### Knee plot
+number of UMIs vs the index position of the reads
+
+```{r knee}
+data[[]] %>%
+  arrange(desc(nCount_RNA)) %>%
+  mutate(selected_cells = mouse == FALSE & condition %in% c("Mock_Blood","M5KO_Blood","Mock_Tumor", "M5KO_Tumor"))%>%
+  mutate(index=1:n()) %>%
+  ggplot(aes(x=index,y=nCount_RNA, color = selected_cells)) + 
+  geom_point(alpha = 0.5, shape=16, size = 0.5) +
+  scale_x_log10() +
+  scale_y_log10() +
+  geom_hline(yintercept = 200, color = "red",linetype = "dashed")+
+  ggtitle(paste0("Selecting human demultiplexed cells vs. UMI count"))
+
+
+
+
+data[[]] %>%
+  arrange(desc(nCount_RNA)) %>%
+  mutate(index=1:n()) %>%
+  ggplot(aes(x=index,y=nCount_RNA, color = source_matrix)) + 
+  geom_point(alpha = 0.5, shape=16, size = 0.5) +
+  scale_x_log10() +
+  scale_y_log10() +
+  geom_hline(yintercept = 200, color = "red",linetype = "dashed")+
+  ggtitle(paste0("Before selecting human non-mito cells ",
+                 length(Cells(data)),
+                 "\nCellRanger suggested further filtering (filtered;raw)\nSeurat current threshold min 200 UMI (red dashed line)"))
+
+
+data1[[]] %>%
+  arrange(desc(nCount_RNA)) %>%
+  mutate(index=1:n()) %>%
+  ggplot(aes(x=index,y=nCount_RNA, color = source_matrix)) + 
+  geom_point(alpha = 0.5, shape=16, size = 0.5) +
+  scale_x_log10() +
+  scale_y_log10() +
+  geom_hline(yintercept = 200, color = "red",linetype = "dashed")+
+    ggtitle(paste0("After selecting human non-mito cells ",
+                 length(Cells(data1)),
+                 "\nCellRanger suggested further filtering (filtered;raw)\nSeurat current threshold min 200 UMI (red dashed line)"))
+
+
+```
+
+## RNA and cell per condition after filtering
+
+```{r qc_after_filt}
+VlnPlot(data1, features = c("nFeature_RNA", "nCount_RNA", "percent.Hs.mito"), ncol = 3, alpha = 0.1)
+ggplot(data1[[]], aes(x=condition))+
+  geom_bar()+
+  ylab("cell count after filtering")
+
+
+```
+
+## Average count per gene and aggregated (sum) count per gene
+
+```{r avr_exp}
+avr.exp = AverageExpression(object = data1, group.by = c('condition'), layer = "count" )$RNA
+avr.exp = avr.exp[!grepl("mm10-", rownames(avr.exp)),]
+avr.exp %>%
+  as.data.frame()%>%
+  rownames_to_column("rowname") %>%
+  pivot_longer(cols = !rowname, names_to = "condition", values_to = "avr.count") %>%
+  ggplot(aes(x=log10(avr.count), color = condition))+
+  geom_density(position = "identity")
+agg.exp = AggregateExpression(object = data1, group.by = c('condition'))$RNA
+agg.exp = agg.exp[!grepl("mm10-", rownames(agg.exp)),]
+agg.exp %>%
+  as.data.frame()%>%
+  rownames_to_column("rowname") %>%
+  pivot_longer(cols = !rowname, names_to = "condition", values_to = "sum.count") %>%
+  ggplot(aes(x=log10(sum.count), color = condition))+
+  geom_density(position = "identity")
+
+rm(avr.exp,agg.exp)
+#AggregateExpression is used for pseudobulk expression analysis, followed by DESeq2
+
+```
+
+
+
+## Determine if the dimentionality of the dataset is smaller after filtering
+
+```{r dim_filt}
+ElbowPlot(data1, reduction = "RNA_pca")+ ggtitle("after filtering out mouse and doubtful demultiplexing")
+ElbowPlot(data, reduction = "RNA_pca")+ ggtitle("before filtering")
+```
+
+## Rename human genes after filtering
+
+```{r rename_genes}
+## to do rename all other matrixes
+RenameGenesSeurat <- function(obj, newnames ) {
+  print("It only changes obj@assays$RNA@counts, @data, @meta.features")
+  RNA <- obj@assays$RNA
+
+  if (nrow(RNA) == length(newnames)) {
+    if (length(RNA@counts)) RNA@counts@Dimnames[[1]]            <- newnames
+    if (length(RNA@data)) RNA@data@Dimnames[[1]]                <- newnames
+    if (length(RNA@data)) rownames(RNA@meta.features)               <- newnames
+  } else {"Unequal gene sets: nrow(RNA) != nrow(newnames)"}
+
+  obj@assays$RNA <- RNA
+  return(obj)
+}
+data1 = RenameGenesSeurat(obj = data1, newnames = gsub("GRCh38-", "", Features(data1)))
+
+data1@assays$RNA@var.features <- Features(data1)[1] #this is incorrect, so make sure to replace this
+```
+
+## Scale
+
+```{r scale}
+
+# Scale genes
+data1 <- ScaleData(data1, features = rownames(data1))
+
+```
+
+
+## Find variable features
+
+
+```{r variable_genes}
+
+data1 <- FindVariableFeatures(data1, selection.method = "vst", nfeatures = 2000)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(data1), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(data1)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot2
+
+
+
+```
+
+## Dimentionality reduction
+
+```{r new_dim_red}
+
+#Dimentionality reduction
+data1 <- RunPCA(data1, features = VariableFeatures(object = data1), reduction.name = "human_pca")
+
+```
+
+
+## Cluster cells and run UMAP
+
+```{r new_umap}
+data1 <- FindNeighbors(data1, dims = 1:12, reduction = "human_pca")
+data1 <- FindClusters(data1, resolution = 0.5, graph.name = "RNA_snn")
+data1 <- RunUMAP(data1, dims = 1:12, reduction = "human_pca", reduction.name = "human_umap")
+DimPlot(data1, reduction = "human_umap", label = TRUE)
+
+saveRDS(data1, file = "data1.rds")
+
+```
+
+## Check cell cycle
+
+```{r cell_cycle}
+# A list of cell cycle markers, from Tirosh et al, 2015, is loaded with Seurat.  We can
+# segregate this list into markers of G2/M phase and markers of S phase
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+data1 <- CellCycleScoring(data1, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+DimPlot(data1, reduction = "human_umap", label = TRUE)
+DimPlot(data1, reduction = "human_umap", label = TRUE, split.by = "condition", ncol =2)
+
+pdf(file = "umap_cell_cycle_phase.pdf",width = 4, height = 3)
+  DimPlot(data1, reduction = "human_umap",group.by ="Phase",  label = FALSE)+
+  xlab("umap1")+
+  ylab("umap2")
+dev.off()
+
+data1[[]] %>%
+  dplyr::select(condition, Phase) %>%
+  group_by(condition) %>%
+  mutate(condition_total_per_group = n()) %>%
+  ungroup() %>%
+  group_by(condition, Phase) %>%
+  summarize(cells = n(),
+            condition_total_per_group = dplyr::first(condition_total_per_group)) %>%
+  mutate(percent.condition = 100 * cells / condition_total_per_group) -> cycle.df
+
+knitr::kable(cycle.df, digits = 3)
+
+ggplot(data = cycle.df, aes(fill = Phase, x = condition, y = percent.condition)) + 
+ geom_bar(position = "stack", stat = "identity")
+
+pdf(file = "barchart_cell_cycle.pdf",width = 3, height = 3)
+ggplot(data = cycle.df, aes(fill = Phase, x = condition, y = percent.condition)) + 
+ geom_bar(position = "stack", stat = "identity")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=1))
+dev.off()
+
+#change back to seurat_clusters as ID
+Idents(data1) <- "seurat_clusters"
+
+```
+
+
+## Annotate cell types and relate the Azimuth labels to our own clusters
+relate the Azimuth labels to our own clusters
+
+```{r azimuth}
+RunAzimuth(data1, reference = "pbmcref", ) -> data1
+
+DimPlot(data1, reduction = "human_umap", group.by = "predicted.celltype.l2", label = TRUE, pt.size = 2)
+data1[[]] %>%
+  as_tibble(rownames="Cell") %>%
+  group_by(seurat_clusters, predicted.celltype.l2) %>%
+  count() %>%
+  ungroup() %>%
+  ggplot(aes(x=seurat_clusters, y=n, fill=predicted.celltype.l2)) +
+  geom_col()
+#as a table
+
+data1[[]] %>%
+  as_tibble(rownames="Cell") %>%
+  group_by(seurat_clusters, predicted.celltype.l1,predicted.celltype.l2) %>%
+  count() %>%
+  group_by(seurat_clusters) %>%
+  mutate(
+    percentage = 100*n/sum(n)
+  ) %>%
+  ungroup() %>%
+  arrange(desc(percentage)) %>%
+  group_by(seurat_clusters) %>%
+  slice(1)
+```
+
+
+## Plot selected genes on umap
+
+```{r sel_genes_umap, fig.width=12, fig.height=20}
+
+#NK cells are typically defined as CD3-CD56+ cells
+#CD3E = CD3E
+#NCAM1 = CD56
+#CD8A
+#CD4
+#SELL = CD62L (TCM)
+#CCR7 = CCR7 (TCM)
+#PTPRC = CD45 (all  lymphocytes from human have isoforms RA or RO; PTPRC(CD45) RA long isoform: Tnaive, Teff, RO short isoform)
+#NECTIN2 = CD122 (Teffector and TEM)
+#FAS = CD95 (Teffector)
+#PDCD1 = PD-1	Exhaustion
+#CTLA4	CTLA-4	Exhaustion
+#HAVCR2	TIM-3	Exhaustion
+#IL2RA	CD25	Activation
+#CD69 early activation marker 
+
+Idents(data1) <- "condition"
+highlight_genes = c("MGAT5","CD3E","NCAM1", "PTPRC", "CD8A", "CD4", "SELL", "CCR7", "NECTIN2" , "FAS",  "PDCD1","CTLA4","HAVCR2","IL2RA","CD69", "TNF", "GZMB", "IFNG")
+FeaturePlot(data1, features = highlight_genes, ncol = 3, reduction = "human_umap")
+
+pdf(file = "cd45_cd4_cd8.pdf",width = 9, height = 3)
+FeaturePlot(data1, features = c("PTPRC", "CD8A", "CD4"), ncol = 3, reduction = "human_umap")
+dev.off()
+
+```
+
+
+## Distingiush CD4 and CD8 cells by sub-clastering
+
+```{r cd4_cd8_separ}
+#save human_umap clusters based on default Seurat workflow
+data1[["seurat_clusters_23012025"]] <- data1$seurat_clusters
+Idents(data1) <- data1$"seurat_clusters_23012025"
+names(data1@graphs)
+
+#which PC is associated with CD4 vs. CD8
+loads = Loadings(data1, reduction = "human_pca")
+loads = loads[rownames(loads) %in% c("CD8A", "CD8B", "CD4"),]
+loads %>%
+  as.data.frame()%>%
+  rownames_to_column("gene")%>%
+  pivot_longer(!gene) %>%
+  mutate(name = factor(name, levels = colnames(loads)))%>%
+  ggplot(aes(x = name, y= value, color = gene, group = gene))+
+  geom_line()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 0.5, vjust = 0.5)) 
+
+FeaturePlot(data1, features = c("PC_5","CD8A", "CD8B", "CD4"),ncol = 2, reduction = "human_umap")
+
+#save a metadata column corresponding to the sign of PC_5 (as an indicator for CD8 cells PC_5>)
+data1$PC5_sign = sign(Embeddings(data1, reduction = "human_pca")[,"PC_5"])
+table(data1$PC5_sign)
+
+FeaturePlot(data1, features = c("PC_5", "PC5_sign","CD8A", "CD4"),ncol = 2, reduction = "human_umap")
+
+
+# subcluster cluster 3,5, 6,7 and 9
+data1 <- FindSubCluster(
+  data1,
+  cluster = "5",
+  graph.name = "RNA_snn",
+  subcluster.name = "sub.cluster5",
+  resolution = 0.2,
+  algorithm = 1
+)
+data1 <- FindSubCluster(
+  data1,
+  cluster = "6",
+  graph.name = "RNA_snn",
+  subcluster.name = "sub.cluster6",
+  resolution = 0.1,
+  algorithm = 1
+)
+data1 <- FindSubCluster(
+  data1,
+  cluster = "9",
+  graph.name = "RNA_snn",
+  subcluster.name = "sub.cluster9",
+  resolution = 0.2,
+  algorithm = 1
+)
+
+data1$sub.cluster3 <- data1$seurat_clusters
+data1$sub.cluster3 <- ifelse(data1$sub.cluster3 =="3" & FetchData(data1, vars = "CD8A")>0, "3_0",
+                             ifelse(data1$sub.cluster3 =="3" & FetchData(data1, vars = "CD8A")==0, "3_1", 
+                                    as.character(data1$sub.cluster3)))
+
+data1$sub.cluster7 <- data1$seurat_clusters
+data1$sub.cluster7 <- ifelse(data1$sub.cluster7 =="7" & FetchData(data1, vars = "CD8A")>0, "7_0",
+                             ifelse(data1$sub.cluster7 =="7" & FetchData(data1, vars = "CD8A")==0, "7_1",
+                                    as.character(data1$sub.cluster7)))
+
+#FeaturePlot(data1, features = c("CD8A"), reduction = "human_umap")
+#FeaturePlot(data1, features = c("CD4"), reduction = "human_umap")
+#DimPlot(data1, reduction = "human_umap", , group.by = "sub.cluster5", label = TRUE)
+#DimPlot(data1, reduction = "human_umap", , group.by = "sub.cluster6", label = TRUE)
+#DimPlot(data1, reduction = "human_umap", , group.by = "sub.cluster7", label = TRUE)
+#DimPlot(data1, reduction = "human_umap", , group.by = "sub.cluster9", label = TRUE)
+#Idents(data1) <- data1$sub.cluster3
+#DimPlot(data1, reduction = "human_umap", label = TRUE, 
+#        cells.highlight = list(WhichCells(data1, idents =  "3_0" ),
+#                               WhichCells(data1, idents =  "3_1" )),
+#        cols.highlight = c("yellow", "blue"), alpha = 0.2)
+#Idents(data1) <- data1$seurat_clusters
+
+#join clusters
+data1[[]] %>%
+  select(seurat_clusters, sub.cluster3, sub.cluster5, sub.cluster6, sub.cluster7,sub.cluster9) %>%
+  summarize(seurat_clusters_update = apply(., 1, function(x) ifelse(any(grepl("_", x)) , x[grepl("_", x)], x[1]))) -> seurat_clusters_update
+table(seurat_clusters_update)
+
+#Update cluster definition
+seurat_clusters_update = dplyr::recode(seurat_clusters_update[,1],
+                                "3_0" = "3", 
+                                "3_1"="15",
+                                "5_0" = "5", "5_2"="5",
+                                "5_1"="12",
+                                "7_0" = "7",
+                                "6_1" = "6",
+                                "7_1" = "13",
+                                "6_0" ="14",
+                                "9_0" = "11",
+                                "9_1" = "9",
+                                .default = seurat_clusters_update[,1])
+seurat_clusters_update = factor(seurat_clusters_update, levels=as.character(sort(as.numeric(unique(seurat_clusters_update)))) )
+table(seurat_clusters_update)
+names(seurat_clusters_update) <- Cells(data1)
+data1[["seurat_clusters_update"]] <- seurat_clusters_update
+
+FeaturePlot(data1, features = c("CD8A"), reduction = "human_umap")
+FeaturePlot(data1, features = c("CD4"), reduction = "human_umap")
+DimPlot(data1, reduction = "human_umap", , group.by = "seurat_clusters_update", label = TRUE)
+
+pdf(file = "umap_seurat_clusters_update.pdf",width = 3, height = 3)
+DimPlot(data1, reduction = "human_umap", , group.by = "seurat_clusters_update", label = TRUE)+
+  theme(legend.position="none")+
+  xlab("umap1")+
+  ylab("umap2")
+dev.off()
+
+#remove the intermediate clusters
+data1$sub.cluster3 <- NULL
+data1$sub.cluster5 <- NULL
+data1$sub.cluster6 <- NULL
+data1$sub.cluster7 <- NULL
+data1$sub.cluster9 <- NULL
+
+
+
+# track CD8 and CD4 expression in clusters:
+data1[[]] %>%
+  select(seurat_clusters_update) %>%
+  mutate(CD4 = ifelse(FetchData(data1, vars = "CD4")>0, "CD4+","CD4-"),
+         CD8 = ifelse(FetchData(data1, vars = "CD8A")>0, "CD8+","CD8-"),
+         CD = paste0(CD4, CD8) ) %>%
+  group_by(seurat_clusters_update) %>%
+  mutate(total_per_group = n()) %>%
+  ungroup() %>%
+  group_by(seurat_clusters_update, CD) %>%
+  summarize(cells = n(),
+            total_per_group = first(total_per_group)) %>%
+  filter(!(CD %in% c("CD4-CD8-", "CD4+CD8+"))) %>%
+  mutate(percent.cells = 100 * cells / total_per_group) %>%
+  arrange(desc(percent.cells)) %>%
+  slice_head(n = 2) -> CD.df
+
+knitr::kable(CD.df, digits = 1)
+
+#expected CD4 tumor: 12 4 15 blood 13 14 0
+#expected CD8 tumor:5 2 3  blood 1 9
+
+## Manually annotate cell types
+##CD8 tumor "5",  "2", "3"
+##CD4 tumor "12", "4", "15"
+##CD8 prolif blood "7", "6"
+##CD4 prolif blood "13", "14"
+##CD8 blood "1", "9"
+##CD4 blood "0", "11"
+##other T cells 10
+##other T cells 8
+
+Tcells = dplyr::recode(seurat_clusters_update,
+                                "0" = "CD4 blood",
+                                "1" = "CD8 blood", 
+                                "2"="CD8 tumor",
+                                "3" = "CD8 tumor", 
+                                "4"="CD4 tumor",
+                                "5"="CD8 tumor",
+                                "6" = "CD8 prolif blood",
+                                "7" = "CD8 prolif blood",
+                                "8" = "other T cells",
+                                "9" ="CD8 blood",
+                                "10" = "other T cells",
+                                "11" = "CD4 blood",
+                                "12" = "CD4 tumor",
+                                "13" = "CD4 prolif blood",
+                                "14" = "CD4 prolif blood",
+                                "15" = "CD4 tumor",
+                                .default = NULL)
+Tcells = factor(Tcells, levels = sort(unique(as.character(Tcells))))
+table(Tcells)
+names(Tcells) <- Cells(data1)
+data1[["Tcells"]] <- Tcells
+
+DimPlot(data1, reduction = "human_umap", group.by = "Tcells", label = TRUE)
+
+#plot MGAT5 vs. Mock separately to show that that our experimental conditions produce the same cell types
+data1[["genotype"]] <- str_split_fixed(data1$condition, "_", 2)[,1]
+DimPlot(data1, reduction = "human_umap", label = TRUE, group.by = "Tcells", split.by = "genotype", ncol =2)
+DimPlot(data1, reduction = "human_umap", label = FALSE, group.by = "Tcells", split.by = "genotype", ncol =2)
+png(filename = "umap_tcells_genotype.png",width = 6, height = 3.5, units = "in", res = 300)
+DimPlot(data1, reduction = "human_umap", label = FALSE, group.by = "Tcells", split.by = "genotype", ncol =2)+
+  xlab("umap1")+
+  ylab("umap2")
+dev.off()
+pdf(file = "umap_tcells_genotype.pdf",width = 6, height = 3.5)
+DimPlot(data1, reduction = "human_umap", label = FALSE, group.by = "Tcells", split.by = "genotype", ncol =2)+
+  xlab("umap1")+
+  ylab("umap2")
+dev.off()
+
+```
+
+## Explore cell cycle per cluster or T-cell type
+
+```{r barchart_cell_cycle}
+data1[[]] %>%
+  select(seurat_clusters_update, Phase) %>%
+  group_by(seurat_clusters_update) %>%
+  mutate(total_per_group = n()) %>%
+  ungroup() %>%
+  group_by(seurat_clusters_update, Phase) %>%
+  summarize(cells = n(),
+            total_per_group = first(total_per_group)) %>%
+  mutate(percent.cells = 100 * cells / total_per_group) -> cycle.df
+
+knitr::kable(cycle.df, digits = 1)
+
+ggplot(data = cycle.df, aes(fill = Phase, x = seurat_clusters_update, y = percent.cells)) + 
+ geom_bar(position = "stack", stat = "identity")
+
+data1[[]] %>%
+  select(Tcells, Phase) %>%
+  group_by(Tcells) %>%
+  mutate(total_per_group = n()) %>%
+  ungroup() %>%
+  group_by(Tcells, Phase) %>%
+  summarize(cells = n(),
+            total_per_group = first(total_per_group)) %>%
+  mutate(percent.cells = 100 * cells / total_per_group) -> cycle.df
+
+knitr::kable(cycle.df, digits = 1)
+
+ggplot(data = cycle.df, aes(fill = Phase, x = Tcells, y = percent.cells)) + 
+ geom_bar(position = "stack", stat = "identity")
+
+```
+
+## Perform DE analysis of each cluster agains all others (without separating conditions)
+
+gene must be measured in at least 25% of the cells in either cluster 1 or all of the other other cells in order to be tested. This cuts down on testing genes which are effectively unexpressed
+
+```{r de_vs_all}
+#change to updated seurat_clusters as ID
+Idents(data1) <- data1$seurat_clusters_update
+
+cluster.markers <- FindAllMarkers(data1, only.pos = TRUE, min.pct = 0.25)
+#cluster.markers <- FindAllMarkers(data1, min.pct = 0.25, logfc.threshold = 0.5, test.use = "roc")
+cluster.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1)
+
+cluster.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n = 5) %>%
+    ungroup() -> top5
+
+writexl::write_xlsx(cluster.markers, "cluster.markers.xlsx")
+DoHeatmap(data1, features = top5$gene) + NoLegend() +theme_bw(base_size = 5)
+
+#change to T cell types as ID
+Idents(data1) <- data1$Tcells
+
+cluster.markers <- FindAllMarkers(data1, only.pos = TRUE, min.pct = 0.25)
+#cluster.markers <- FindAllMarkers(data1, min.pct = 0.25, logfc.threshold = 0.5, test.use = "roc")
+cluster.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1)
+
+cluster.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n =5 ) %>%
+    ungroup() -> top5
+
+writexl::write_xlsx(cluster.markers, "Tcells.markers.xlsx")
+DoHeatmap(data1, features = top5$gene) + NoLegend() +theme_bw(base_size = 5)
+
+
+
+```
+
+## Plot UMAP per condition
+
+
+```{r condition_umap}
+Idents(data1) <- data1$seurat_clusters_update
+DimPlot(data1, reduction = "human_umap", group.by = "condition", alpha = 0.5)
+DimPlot(data1, reduction = "human_umap", label = TRUE, split.by = "condition", ncol = 2)
+
+data1[["origin"]] <- str_split_fixed(data1$condition, "_", 2)[,2]
+pdf(file = "umap_blood_tumor.pdf",width = 4, height = 3)
+DimPlot(data1, reduction = "human_umap", group.by = "origin", alpha = 0.5)+
+  scale_color_manual(values = c("red3", "grey50"))+
+  xlab("umap1")+
+  ylab("umap2")
+dev.off()
+
+data0 = subset(x = data1, subset =condition %in% c("Mock_Tumor", "M5KO_Tumor"))
+DimPlot(data0,
+        reduction = "human_umap", label = TRUE, split.by = "condition", ncol = 2)
+DimPlot(data0,
+        reduction = "human_umap", label = TRUE, group.by = "source_matrix", split.by = "condition", ncol = 2)
+rm(data0)
+
+data0 = subset(x = data1, subset =condition %in% c("Mock_Blood", "M5KO_Blood"))
+DimPlot(data0,
+        reduction = "human_umap", label = TRUE, split.by = "condition", ncol = 2)
+DimPlot(data0,
+        reduction = "human_umap", label = TRUE, group.by = "source_matrix", split.by = "condition", ncol = 2)
+rm(data0)
+
+#this cluster 2 data visible in the SC core report is not there anymore? (CreateSeuratObject )
+#min.cells.threshold   : num 3
+#  .. .. .. ..$ min.Features.threshold: num 200
+#  .. .. .. ..$ nFeatures             : int 34606
+#  .. .. .. ..$ nCells                : int 18793
+#  $ mito.drop        : int 256
+#  .. .. .. .. ..$ total.drop       : int 256
+#  .. .. .. .. ..$ nCells           : int 18537
+#  .. .. .. .. ..$ nFeatures        : int 3460
+
+```
+
+
+## Plot cluster vs. condition
+
+
+```{r cluster_Vs_condition}
+#conditions.df = as.data.frame(table(paste (data1$condition, data1$seurat_clusters))) 
+conditions.df = as.data.frame(table(paste (data1$condition, data1$seurat_clusters_update))) 
+colnames(conditions.df) = c("combi", "cells")
+conditions.df$condition = str_split_fixed(conditions.df$combi, " ",2)[,1]
+conditions.df$condition = factor(conditions.df$condition, levels = c("Mock_Blood","M5KO_Blood","Mock_Tumor", "M5KO_Tumor") )
+conditions.df$seurat_clusters = str_split_fixed(conditions.df$combi, " ",2)[,2]
+conditions.df$seurat_clusters = factor(conditions.df$seurat_clusters, levels = sort(as.numeric(unique(conditions.df$seurat_clusters))) )
+
+conditions.df %>%
+  group_by(condition) %>%
+  mutate(condition_total_per_group = sum(cells)) ->conditions.df
+
+conditions.df$percent.condition = 100 * conditions.df$cells / conditions.df$condition_total_per_group
+
+ggplot(data = conditions.df, aes(x=condition, y = seurat_clusters, size =percent.condition, color = percent.condition)) +
+  geom_point()+
+  scale_color_gradient(low = "red", high = "blue")+
+  ggtitle("cluster occupation as % cells per condition")+
+  geom_text(aes(label = round(percent.condition, 2)), nudge_y = 0.4)+
+  labs(color = "percent\ncells\nper condition")
+
+ggplot(data = conditions.df, aes(fill = seurat_clusters, x = condition, y = percent.condition)) + 
+ geom_bar(position = "stack", stat = "identity")
+
+```
+
+
+## Plot T cell type vs. condition
+
+
+```{r tcells_vs_condition}
+#conditions.df = as.data.frame(table(paste (data1$condition, data1$seurat_clusters))) 
+conditions.df = as.data.frame(table(paste (data1$condition, data1$Tcells))) 
+colnames(conditions.df) = c("combi", "cells")
+conditions.df$condition = str_split_fixed(conditions.df$combi, " ",2)[,1]
+conditions.df$condition = factor(conditions.df$condition, levels = c("Mock_Blood","M5KO_Blood","Mock_Tumor", "M5KO_Tumor") )
+conditions.df$Tcells = str_split_fixed(conditions.df$combi, " ",2)[,2]
+conditions.df$Tcells = factor(conditions.df$Tcells, levels = sort(unique(conditions.df$Tcells)) )
+
+conditions.df %>%
+  group_by(condition) %>%
+  mutate(condition_total_per_group = sum(cells)) ->conditions.df
+
+conditions.df$percent.condition = 100 * conditions.df$cells / conditions.df$condition_total_per_group
+
+ggplot(data = conditions.df, aes(x=condition, y = Tcells, size =percent.condition, color = percent.condition)) +
+  geom_point()+
+  scale_color_gradient(low = "red", high = "blue")+
+  ggtitle("cluster occupation as % cells per condition")+
+  geom_text(aes(label = round(percent.condition, 2)), nudge_y = 0.4)+
+  labs(color = "percent\ncells\nper condition")
+
+ggplot(data = conditions.df, aes(fill = Tcells, x = condition, y = percent.condition)) + 
+ geom_bar(position = "stack", stat = "identity")
+
+```
+
+## Perform DE analysis within the same cluster across conditions
+
+```{r de_cluster_condition}
+#count cells per cluster per condition
+sort(table(paste(data1$condition, data1$seurat_clusters_update, sep = "_")))
+#minimum 10 cells per cluster to perform DE analysis
+
+data1$condition_cluster <- paste(data1$condition, data1$seurat_clusters_update, sep = "_")
+data1$condition_cluster = as.factor(data1$condition_cluster)
+Idents(data1) <- "condition_cluster"
+
+##### TUMOR
+de.res = list()
+count = 0
+for (cluster in levels(data1$seurat_clusters_update)){
+  count = count + 1
+  id1 = paste0("M5KO_Tumor_", cluster)
+  id2 = paste0("Mock_Tumor_", cluster)
+  if (sum(data1$condition_cluster == id1)>10 & sum(data1$condition_cluster == id2)>10 ){
+    de.res[[count]] <- FindMarkers(data1, ident.1 = id1, ident.2 = id2, verbose = FALSE, min.pct = 0.25)
+  } else{
+    de.res[[count]] = NA
+  }
+  names(de.res)[count]=paste0(id1, "_vs_",id2)
+}
+
+
+
+
+
+# find DE genes
+de.genes = list()
+for (i in 1:length(de.res)){
+  if(length(de.res[[i]])>1){
+    de.res[[i]] %>%
+      rownames_to_column(var = "gene_name")%>%
+      mutate(contrast = names(de.res)[i]) -> de.res[[i]]
+      de.res[[i]] %>%
+        dplyr::filter(p_val_adj < 0.05) -> de.genes[[i]]
+    if(nrow(de.genes[[i]])>0){
+      id1 = str_split_fixed(de.genes[[i]]$contrast[1], "_vs_",2)[,1]
+      id2 = str_split_fixed(de.genes[[i]]$contrast[1], "_vs_",2)[,2]
+          print(VlnPlot(data1, features = de.genes[[i]]$gene_name[1:2], idents = c(id1, id2)) )
+    } else{de.genes[[i]] = NA}
+
+  } else {
+    de.genes[[i]] = NA
+  }
+}
+
+
+
+de.genes.db1 = do.call("rbind", de.genes[unlist(!is.na(de.genes))] )
+
+##### BLOOD
+de.res = list()
+count = 0
+for (cluster in levels(data1$seurat_clusters_update)){
+  count = count + 1
+  id1 = paste0("M5KO_Blood_", cluster)
+  id2 = paste0("Mock_Blood_", cluster)
+  if (sum(data1$condition_cluster == id1)>10 & sum(data1$condition_cluster == id2)>10 ){
+    de.res[[count]] <- FindMarkers(data1, ident.1 = id1, ident.2 = id2, verbose = FALSE, min.pct = 0.25)
+  } else{
+    de.res[[count]] = NA
+  }
+  names(de.res)[count]=paste0(id1, "_vs_",id2)
+}
+
+
+
+
+
+# find DE genes
+de.genes = list()
+for (i in 1:length(de.res)){
+  if(length(de.res[[i]])>1){
+    de.res[[i]] %>%
+      rownames_to_column(var = "gene_name")%>%
+      mutate(contrast = names(de.res)[i]) -> de.res[[i]]
+      de.res[[i]] %>%
+        dplyr::filter(p_val_adj < 0.05) -> de.genes[[i]]
+    if(nrow(de.genes[[i]])>0){
+      id1 = str_split_fixed(de.genes[[i]]$contrast[1], "_vs_",2)[,1]
+      id2 = str_split_fixed(de.genes[[i]]$contrast[1], "_vs_",2)[,2]
+          print(VlnPlot(data1, features = de.genes[[i]]$gene_name[1:2], idents = c(id1, id2)) )
+    } else{de.genes[[i]] = NA}
+
+  } else {
+    de.genes[[i]] = NA
+  }
+}
+
+
+
+de.genes.db2 = do.call("rbind", de.genes[unlist(!is.na(de.genes))] )
+
+de.genes.cond.clust = rbind(de.genes.db1, de.genes.db2)
+
+de.genes.cond.clust %>%
+    group_by(contrast) %>%
+    dplyr::arrange(desc(abs(avg_log2FC	))) %>%
+    slice_head(n = 5) %>%
+    ungroup() -> top5
+knitr::kable(top5, digits = 3)
+writexl::write_xlsx(de.genes.cond.clust, "DE.genes.condition_cluster.xlsx")
+
+
+
+```
+
+## Perform DE analysis within the same Tcell type across conditions
+
+```{r de_Tcells_condition}
+#count cells per cell type per condition
+sort(table(paste(data1$condition, data1$Tcells, sep = ": ")))
+#minimum 20 cells per cluster to perform DE analysis
+
+data1$condition_Tcells <- paste(data1$condition, data1$Tcells, sep = ": ")
+levs = outer(levels(data1$condition),levels(data1$Tcells), FUN = paste, sep = ": " )
+dim(levs)<-NULL
+data1$condition_Tcells = factor(data1$condition_Tcells , 
+                                levels =  levs)
+Idents(data1) <- "condition_Tcells"
+
+##### TUMOR
+de.res = list()
+count = 0
+for (type in levels(data1$Tcells)){
+  count = count + 1
+  id1 = paste0("M5KO_Tumor: ", type)
+  id2 = paste0("Mock_Tumor: ", type)
+  if (sum(data1$condition_Tcells == id1)>20 & sum(data1$condition_Tcells == id2)>20 ){
+    de.res[[count]] <- FindMarkers(data1, ident.1 = id1, ident.2 = id2, verbose = FALSE, min.pct = 0.25)
+  } else{
+    de.res[[count]] = NA
+  }
+  names(de.res)[count]=paste0(id1, " vs ",id2)
+}
+
+
+
+
+
+# find DE genes
+de.genes = list()
+for (i in 1:length(de.res)){
+  if(length(de.res[[i]])>1){
+    de.res[[i]] %>%
+      rownames_to_column(var = "gene_name")%>%
+      mutate(contrast = names(de.res)[i]) -> de.res[[i]]
+      de.res[[i]] %>%
+        dplyr::filter(p_val_adj < 0.05) -> de.genes[[i]]
+    if(nrow(de.genes[[i]])>0){
+      id1 = str_split_fixed(de.genes[[i]]$contrast[1], " vs ",2)[,1]
+      id2 = str_split_fixed(de.genes[[i]]$contrast[1], " vs ",2)[,2]
+          print(VlnPlot(data1, features = de.genes[[i]]$gene_name[1:2], idents = c(id1, id2)) )
+    } else{de.genes[[i]] = NA}
+
+  } else {
+    de.genes[[i]] = NA
+  }
+}
+
+
+
+de.genes.db1 = do.call("rbind", de.genes[unlist(!is.na(de.genes))] )
+de.res.db1 = do.call("rbind", de.res[unlist(!is.na(de.res))] )
+
+##### BLOOD
+de.res = list()
+count = 0
+for (type in levels(data1$Tcells)){
+  count = count + 1
+  id1 = paste0("M5KO_Blood: ", type)
+  id2 = paste0("Mock_Blood: ", type)
+  if (sum(data1$condition_Tcells == id1)>20 & sum(data1$condition_Tcells == id2)>20 ){
+    de.res[[count]] <- FindMarkers(data1, ident.1 = id1, ident.2 = id2, verbose = FALSE, min.pct = 0.25)
+  } else{
+    de.res[[count]] = NA
+  }
+  names(de.res)[count]=paste0(id1, " vs ",id2)
+}
+
+
+
+
+
+# find DE genes
+de.genes = list()
+for (i in 1:length(de.res)){
+  if(length(de.res[[i]])>1){
+    de.res[[i]] %>%
+      rownames_to_column(var = "gene_name")%>%
+      mutate(contrast = names(de.res)[i]) -> de.res[[i]]
+      de.res[[i]] %>%
+        dplyr::filter(p_val_adj < 0.05) -> de.genes[[i]]
+    if(nrow(de.genes[[i]])>0){
+      id1 = str_split_fixed(de.genes[[i]]$contrast[1], " vs ",2)[,1]
+      id2 = str_split_fixed(de.genes[[i]]$contrast[1], " vs ",2)[,2]
+          print(VlnPlot(data1, features = de.genes[[i]]$gene_name[1:2], idents = c(id1, id2)) )
+    } else{de.genes[[i]] = NA}
+
+  } else {
+    de.genes[[i]] = NA
+  }
+}
+
+
+de.genes.db2 = do.call("rbind", de.genes[unlist(!is.na(de.genes))] )
+de.res.db2 = do.call("rbind", de.res[unlist(!is.na(de.res))] )
+
+##### Tumor vs BLOOD M5KO
+de.res = list()
+count = 0
+type.list = c("CD8 tumor;CD8 blood","CD8 tumor;CD8 prolif blood",
+              "CD4 tumor;CD4 blood","CD4 tumor;CD4 prolif blood", "other T cell;other T cells")
+for (type in type.list){
+  count = count + 1
+  id1 = paste0("M5KO_Tumor: ", str_split_fixed(type, ";", 2)[,1] )
+  id2 = paste0("M5KO_Blood: ", str_split_fixed(type, ";", 2)[,2])
+  if (sum(data1$condition_Tcells == id1)>20 & sum(data1$condition_Tcells == id2)>20 ){
+    de.res[[count]] <- FindMarkers(data1, ident.1 = id1, ident.2 = id2, verbose = FALSE, min.pct = 0.25)
+  } else{
+    de.res[[count]] = NA
+  }
+  names(de.res)[count]=paste0(id1, " vs ",id2)
+}
+
+
+# find DE genes
+de.genes = list()
+for (i in 1:length(de.res)){
+  if(length(de.res[[i]])>1){
+    de.res[[i]] %>%
+      rownames_to_column(var = "gene_name")%>%
+      mutate(contrast = names(de.res)[i]) -> de.res[[i]]
+      de.res[[i]] %>%
+        dplyr::filter(p_val_adj < 0.05) -> de.genes[[i]]
+    if(nrow(de.genes[[i]])>0){
+      id1 = str_split_fixed(de.genes[[i]]$contrast[1], " vs ",2)[,1]
+      id2 = str_split_fixed(de.genes[[i]]$contrast[1], " vs ",2)[,2]
+          print(VlnPlot(data1, features = de.genes[[i]]$gene_name[1:2], idents = c(id1, id2)) )
+    } else{de.genes[[i]] = NA}
+
+  } else {
+    de.genes[[i]] = NA
+  }
+}
+
+
+de.genes.db3 = do.call("rbind", de.genes[unlist(!is.na(de.genes))] )
+de.res.db3 = do.call("rbind", de.res[unlist(!is.na(de.res))] )
+
+
+##### Tumor vs BLOOD Mock
+de.res = list()
+count = 0
+type.list = c("CD8 tumor;CD8 blood","CD8 tumor;CD8 prolif blood",
+              "CD4 tumor;CD4 blood","CD4 tumor;CD4 prolif blood", "other T cell;other T cells")
+for (type in type.list){
+  count = count + 1
+  id1 = paste0("Mock_Tumor: ", str_split_fixed(type, ";", 2)[,1])
+  id2 = paste0("Mock_Blood: ", str_split_fixed(type, ";", 2)[,2])
+  if (sum(data1$condition_Tcells == id1)>20 & sum(data1$condition_Tcells == id2)>20 ){
+    de.res[[count]] <- FindMarkers(data1, ident.1 = id1, ident.2 = id2, verbose = FALSE, min.pct = 0.25)
+  } else{
+    de.res[[count]] = NA
+  }
+  names(de.res)[count]=paste0(id1, " vs ",id2)
+}
+
+
+# find DE genes
+de.genes = list()
+for (i in 1:length(de.res)){
+  if(length(de.res[[i]])>1){
+    de.res[[i]] %>%
+      rownames_to_column(var = "gene_name")%>%
+      mutate(contrast = names(de.res)[i]) -> de.res[[i]]
+      de.res[[i]] %>%
+        dplyr::filter(p_val_adj < 0.05) -> de.genes[[i]]
+    if(nrow(de.genes[[i]])>0){
+      id1 = str_split_fixed(de.genes[[i]]$contrast[1], " vs ",2)[,1]
+      id2 = str_split_fixed(de.genes[[i]]$contrast[1], " vs ",2)[,2]
+          print(VlnPlot(data1, features = de.genes[[i]]$gene_name[1:2], idents = c(id1, id2)) )
+    } else{de.genes[[i]] = NA}
+
+  } else {
+    de.genes[[i]] = NA
+  }
+}
+
+
+de.genes.db4 = do.call("rbind", de.genes[unlist(!is.na(de.genes))] )
+de.res.db4 = do.call("rbind", de.res[unlist(!is.na(de.res))] )
+
+
+de.genes.cond.Tcells = rbind(de.genes.db1, de.genes.db2, de.genes.db3, de.genes.db4)
+de.results.cond.Tcells = rbind(de.res.db1, de.res.db2, de.res.db3, de.res.db4)
+
+
+de.genes.cond.Tcells %>%
+    group_by(contrast) %>%
+    dplyr::arrange(desc(abs(avg_log2FC	))) %>%
+    slice_head(n = 5) %>%
+    ungroup() -> top5
+knitr::kable(top5, digits = 3)
+writexl::write_xlsx(de.genes.cond.Tcells, "DE.genes.condition_Tcell.xlsx")
+writexl::write_xlsx(de.results.cond.Tcells, "all.genes.condition_Tcell.xlsx")
+
+
+
+```
+
+## Plot gene on UMAP per condition
+
+```{r gene_condition_umap, fig.width=12, fig.height=3}
+Idents(data1) <- "condition"
+FeaturePlot(data1, features = "MGAT5", split.by = "condition")
+VlnPlot(data1, features = "MGAT5", split.by = "condition")
+```
+
+## Aggregate expression
+
+```{r pseudobulk, eval = FALSE}
+# pseudobulk the counts based on donor-condition-celltype
+pseudo_Tcells <- AggregateExpression(data1, assays = "RNA", return.seurat = T, group.by = c("Tcells", "condition"))
+
+# each 'cell' is a Tcell-condition pseudobulk profile
+tail(Cells(pseudo_Tcells))
+
+unique(Idents(pseudo_Tcells))
+pseudo_Tcells$Tcells_condition <- names(pseudo_Tcells$orig.ident)
+Idents(pseudo_Tcells) <- pseudo_Tcells$Tcells_condition
+unique(Idents(pseudo_Tcells))
+
+#bulk.Tcells.de <- FindMarkers(object = pseudo_ifnb, 
+#                         ident.1 = "CD4 blood_M5KO-Blood", 
+#                         ident.2 = "CD4 blood_Mock-Blood",
+#                         test.use = "DESeq2")
+#head(bulk.mono.de, n = 15)
+
+```
+
+## Visualize selected genes aggregated expression
+https://star-protocols.cell.com/protocols/3808 
+
+```{r dotplot_markers_Tcells, fig.width=19, fig.height=9, cache.extra = tools::md5sum("Input/markers_literature.xlsx")}
+Idents(data1) <- "Tcells"
+
+## Read markers
+markers.to.plot = list()
+for(i in 1:3){
+  markers.to.plot[[i]] = readxl::read_excel("Input/markers_literature.xlsx", sheet = i)
+  markers.to.plot[[i]]$Category = factor(markers.to.plot[[i]]$Category, levels = rev(unique(markers.to.plot[[i]]$Category)))
+}
+
+markers.to.plot [[4]] <-data.frame(Gene = c('HSPA6','HSPA1A','HSPB1', # HSPhi
+                                            'TUBB','TUBA1B','FABP5','MIR155HG', # proliferation T
+                                            'IL2','IFNG', # Th1
+                                            'IFNG','IL2','CCL20', # cytokine T
+                                            'IL2RA','CTLA4','FOXP3', #Treg
+                                            'GZMA','GZMK','CST7', #TEMRA
+                                            'IL7R'), # TM
+                                   Category = c(rep("HSPhi", 3),
+                                                rep("proliferation T", 4),
+                                                rep("Th1", 2),
+                                                rep("cytokine T", 3),
+                                                rep("Treg",3),
+                                                rep("TEMRA", 3),
+                                                rep("TM", 1)))
+markers.to.plot[[4]]$Category = factor(markers.to.plot[[4]]$Category, levels = rev(unique(markers.to.plot[[4]]$Category)))
+lapply(markers.to.plot, colnames)
+
+AnnotatedDotPlot <- function(db, seurat.obj, categ_bar){
+  db = db[db$Gene %in% Features(seurat.obj),]
+  db = db[!duplicated(db$Gene),]
+  
+  categ_col = wes_palette("Darjeeling1", length(unique(db$Category)), type = "continuous")
+  #RColorBrewer::brewer.pal(3, "Set3")[1:3]
+  expr_col = "RdYlBu"
+  #DotPlot(data1, features = unique(db$Gene),dot.scale = 8, cols =c('gray','red'), col.min = 0)
+  dot <- DotPlot(data1, features = unique(db$Gene),dot.scale = 8, cols =expr_col) + RotatedAxis() + theme(axis.title=element_blank(),legend.text = element_text(size = 12), legend.title=element_text(size=12), axis.text = element_text(size=12), legend.position = 'right')
+
+
+bar <- ggplot(data = db, aes(x = 1, fill = Category))+RotatedAxis()+
+  geom_bar(position = "stack")+
+  scale_fill_manual(values = categ_col)+
+  theme_bw()+
+  coord_flip()+
+  theme(legend.position='right',
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        legend.text = element_text(size = 12),
+        legend.title=element_text(size=12),
+        axis.text = element_text(size=12),
+        panel.border = element_blank())+
+  scale_y_continuous(expand = c(0,0)) 
+cowplot::plot_grid(dot, bar, nrow=3, align='vh',axis ="rl" , rel_heights = c(1, categ_bar))
+}
+
+
+AnnotatedDotPlot(markers.to.plot[[1]], data1, 0.4)
+AnnotatedDotPlot(markers.to.plot[[2]], data1, 0.4)
+AnnotatedDotPlot(markers.to.plot[[3]], data1, 0.4)
+AnnotatedDotPlot(markers.to.plot[[4]], data1, 0.4)
+
+```
+
+## Visualize aggregate expression across seurat clusters
+
+```{r dotplot_markers_clusters, fig.width=19, fig.height=12, cache.extra = tools::md5sum("Input/markers_literature.xlsx")}
+Idents(data1) <- "seurat_clusters_update"
+
+AnnotatedDotPlot(markers.to.plot[[1]], data1, 0.25)
+AnnotatedDotPlot(markers.to.plot[[2]], data1, 0.25)
+AnnotatedDotPlot(markers.to.plot[[3]], data1,  0.25)
+AnnotatedDotPlot(markers.to.plot[[4]], data1,  0.25)
+
+```
+
+## Visualize aggregate expression across seurat clusters
+
+```{r dotplot_markers_condition_Tcells, fig.width=19, fig.height=12, cache.extra = tools::md5sum("Input/markers_literature.xlsx")}
+Idents(data1) <- "condition_Tcells"
+
+AnnotatedDotPlot <- function(db, seurat.obj, categ_bar){
+  db = db[db$Gene %in% Features(seurat.obj),]
+  db = db[!duplicated(db$Gene),]
+  
+  include = levels(data1$condition_Tcells)[c(1,2,5,6,11,12,13,14,17,18,23,24,25:28)]
+  categ_col = wes_palette("Darjeeling1", length(unique(db$Category)), type = "continuous")
+  #RColorBrewer::brewer.pal(3, "Set3")[1:3]
+  expr_col = "RdYlBu"
+  #DotPlot(data1, features = unique(db$Gene),dot.scale = 8, cols =c('gray','red'), col.min = 0)
+  dot <- DotPlot(data1, features = unique(db$Gene),dot.scale = 8, cols =expr_col, idents = include) + RotatedAxis() + theme(axis.title=element_blank(),legend.text = element_text(size = 12), legend.title=element_text(size=12), axis.text = element_text(size=12), legend.position = 'right')
+
+
+bar <- ggplot(data = db, aes(x = 1, fill = Category))+RotatedAxis()+
+  geom_bar(position = "stack")+
+  scale_fill_manual(values = categ_col)+
+  theme_bw()+
+  coord_flip()+
+  theme(legend.position='right',
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        legend.text = element_text(size = 12),
+        legend.title=element_text(size=12),
+        axis.text = element_text(size=12),
+        panel.border = element_blank())+
+  scale_y_continuous(expand = c(0,0)) 
+cowplot::plot_grid(dot, bar, nrow=3, align='vh',axis ="rl" , rel_heights = c(1, categ_bar))
+}
+
+AnnotatedDotPlot(markers.to.plot[[1]], data1, 0.25)
+AnnotatedDotPlot(markers.to.plot[[2]], data1, 0.25)
+AnnotatedDotPlot(markers.to.plot[[3]], data1,  0.25)
+AnnotatedDotPlot(markers.to.plot[[4]], data1,  0.25)
+
+data1$condition_Tcells = factor(data1$condition_Tcells , 
+                                levels =  levs[c(which(grepl("Tumor",levs)), which(grepl("Blood",levs))) ] )
+Idents(data1) <- "condition_Tcells"
+AnnotatedDotPlotSmall <- function(db, seurat.obj, categ_bar){
+  db = db[db$Gene %in% Features(seurat.obj),]
+  db = db[!duplicated(db$Gene),]
+  
+  include = levels(data1$condition_Tcells)[c(5,6,11,12,15:18, 21:24)]
+  categ_col = wes_palette("Darjeeling1", length(unique(db$Category)), type = "continuous")
+  #RColorBrewer::brewer.pal(3, "Set3")[1:3]
+  expr_col = "RdYlBu"
+  #DotPlot(data1, features = unique(db$Gene),dot.scale = 8, cols =c('gray','red'), col.min = 0)
+  dot <- DotPlot(data1, features = unique(db$Gene),dot.scale = 8, cols =expr_col, idents = include) + RotatedAxis() + theme(axis.title=element_blank(),legend.text = element_text(size = 12), legend.title=element_text(size=12), axis.text = element_text(size=12), legend.position = 'right')
+
+
+bar <- ggplot(data = db, aes(x = 1, fill = Category))+RotatedAxis()+
+  geom_bar(position = "stack")+
+  scale_fill_manual(values = categ_col)+
+  theme_bw()+
+  coord_flip()+
+  theme(legend.position='right',
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        legend.text = element_text(size = 12),
+        legend.title=element_text(size=12),
+        axis.text = element_text(size=12),
+        panel.border = element_blank())+
+  scale_y_continuous(expand = c(0,0)) 
+cowplot::plot_grid(dot, bar, nrow=3, align='vh',axis ="rl" , rel_heights = c(1, categ_bar))
+}
+
+
+png(filename = "gene_panel_expression.png",width = 21, height = 12, units = "in", res = 300)
+AnnotatedDotPlotSmall(markers.to.plot[[1]], data1, 0.25)
+dev.off()
+pdf(file = "gene_panel_expression.pdf",width = 21, height = 12)
+AnnotatedDotPlotSmall(markers.to.plot[[1]], data1, 0.25)
+dev.off()
+
+
+
+data1$condition_Tcells = factor(data1$condition_Tcells , 
+                                levels =  levs[grepl("Tumor",levs)])
+Idents(data1) <- "condition_Tcells"
+```
+
+## Compare to previous studies
+
+```{r GSEA_other_studies, fig.width=4, fig.height=5, cache.extra = tools::md5sum("all.genes.condition_Tcell.xlsx")}
+
+######## compare to other papers
+#load data from papers
+t1 = "C:/Users/Daria/Documents/ElienDeBousser/Fraietta_2018_SupTable3.xlsx"
+t2 = "C:/Users/Daria/Documents/ElienDeBousser/Good2021_tableS1.xlsx"
+set1 = read_xlsx(t1, sheet = 2)
+set2 = read_xlsx(t1, sheet = 3)
+set00 = read_xlsx(t2, sheet = 1)
+set3 = set00[set00$log2FoldChange>=0,]
+set4 = set00[set00$log2FoldChange<0,]
+# create custom gene sets:
+# pathwayID
+set1$pathwayID = "ID_1"
+set2$pathwayID = "ID_2"
+set3$pathwayID = "ID_3"
+set4$pathwayID = "ID_4"
+# pathwayName
+set1$pathwayName = "upregulated in responders Fraietta_2018"
+set2$pathwayName = "upregulated in non-responders Fraietta_2018"
+set3$pathwayName = "upregulated upon long antigen exposure Good2021"
+set4$pathwayName = "downregulated upon long antigen exposure Good2021"
+# geneSymbol
+set1$geneSymbol = set1$`Gene Symbol`
+set2$geneSymbol = set2$`Gene Symbol`
+set3$geneSymbol = set3$Gene
+set4$geneSymbol = set4$Gene
+#bind
+set1 = as.data.frame(set1[,c("pathwayID", "pathwayName","geneSymbol")])
+set2 = as.data.frame(set2[,c("pathwayID", "pathwayName","geneSymbol")])
+set3 = as.data.frame(set3[,c("pathwayID", "pathwayName","geneSymbol")])
+set4 = as.data.frame(set4[,c("pathwayID", "pathwayName","geneSymbol")])
+
+#C:\Users\Daria\Documents\ElienDeBousser\scRNAseq\Stijn_data endogenous CD70 KO in CAR-T nanoCD70 cells
+#Table 2: Differentially expressed genes in nanoCAR T-cells from cluster CD8KO vs CD8WT
+#Table 3: Differentially expressed genes in nanoCAR T-cells from cluster CD4KO vs CD4WT
+#Table 4: Differentially expressed genes in nanoCAR T-cells from cluster CD8KO vs CD4KO
+#Table 5: Differentially expressed genes in nanoCAR T-cells from cluster CD8WT vs CD4WT
+#load data from papers
+t3 = "C:/Users/Daria/Documents/ElienDeBousser/scRNAseq/Stijn_data/suppl/cir-23-0677_table_s2_suppst2.xlsx"
+t4 = "C:/Users/Daria/Documents/ElienDeBousser/scRNAseq/Stijn_data/suppl/cir-23-0677_table_s3_suppst3.xlsx"
+t5 = "C:/Users/Daria/Documents/ElienDeBousser/scRNAseq/Stijn_data/suppl/cir-23-0677_table_s4_suppst4.xlsx"
+t6 = "C:/Users/Daria/Documents/ElienDeBousser/scRNAseq/Stijn_data/suppl/cir-23-0677_table_s5_suppst5.xlsx"
+
+set01 = read_xlsx(t3, sheet = 1)
+colnames(set01)[1] = "geneSymbol"
+set5 = set01[set01$avg_log2FC>=0,]
+set6 = set01[set01$avg_log2FC<0,]
+
+set02 = read_xlsx(t4, sheet = 1)
+colnames(set02)[1] = "geneSymbol"
+set7 = set02[set02$avg_log2FC>=0,]
+set8 = set02[set02$avg_log2FC<0,]
+
+set03 = read_xlsx(t5, sheet = 1)
+colnames(set03)[1] = "geneSymbol"
+set9 = set03[set03$avg_log2FC>=0,]
+set10 = set03[set03$avg_log2FC<0,]
+
+set04 = read_xlsx(t6, sheet = 1)
+colnames(set04)[1] = "geneSymbol"
+set11 = set04[set04$avg_log2FC>=0,]
+set12 = set04[set04$avg_log2FC<0,]
+
+# create custom gene sets:
+# pathwayID
+set5$pathwayID = "ID_5"
+set6$pathwayID = "ID_6"
+set7$pathwayID = "ID_7"
+set8$pathwayID = "ID_8"
+set9$pathwayID = "ID_9"
+set10$pathwayID = "ID_10"
+set11$pathwayID = "ID_11"
+set12$pathwayID = "ID_12"
+
+# pathwayName
+set5$pathwayName = "upregulated CD8KO vs CD8WT DeMunter_2024"
+set6$pathwayName = "downregulated CD8KO vs CD8WT DeMunter_2024"
+set7$pathwayName = "upregulated CD4KO vs CD4WT DeMunter_2024"
+set8$pathwayName = "downregulated CD4KO vs CD4WT DeMunter_2024"
+set9$pathwayName = "upregulated CD8KO vs CD4KO DeMunter_2024"
+set10$pathwayName = "downpregulated CD8KO vs CD4KO DeMunter_2024"
+set11$pathwayName = "upregulated CD8WT vs CD4WT DeMunter_2024"
+set12$pathwayName = "downpregulated CD8WT vs CD4WT DeMunter_2024"
+
+
+# geneSymbol already done
+
+#bind
+set5 = as.data.frame(set5[,c("pathwayID", "pathwayName","geneSymbol")])
+set6 = as.data.frame(set6[,c("pathwayID", "pathwayName","geneSymbol")])
+set7 = as.data.frame(set7[,c("pathwayID", "pathwayName","geneSymbol")])
+set8 = as.data.frame(set8[,c("pathwayID", "pathwayName","geneSymbol")])
+set9 = as.data.frame(set9[,c("pathwayID", "pathwayName","geneSymbol")])
+set10 = as.data.frame(set10[,c("pathwayID", "pathwayName","geneSymbol")])
+set11 = as.data.frame(set11[,c("pathwayID", "pathwayName","geneSymbol")])
+set12 = as.data.frame(set12[,c("pathwayID", "pathwayName","geneSymbol")])
+
+
+custom_sets = rbind(set1, set2, set3, set4, set5, set6, set7, set8, set9, set10, set11, set12)
+write.table(custom_sets, "other_studies_custom_gene_sets.txt", sep = "\t")
+
+#check if geneSymbol from the paper is in our result table
+table(unique(custom_sets$geneSymbol) %in% Features(data1))
+
+# change gene names and aliases to Approved.symbol
+alias = read.csv("C:/Users/Daria/Documents/ElienDeBousser/HGNC_biomart_gene_aliases.txt", sep = "\t")
+
+alias %>%
+  select(Approved.symbol, Previous.symbol, Alias.symbol, Ensembl.gene.ID) %>%
+  mutate(gene = Approved.symbol)%>%
+  select(gene, Approved.symbol, Previous.symbol, Alias.symbol, Ensembl.gene.ID) %>%
+  pivot_longer(!gene) %>%
+  filter(value != "")-> alias2
+
+custom_sets$gene = alias2$gene[match(custom_sets$geneSymbol, alias2$value)]
+custom_sets_filtered = custom_sets[!is.na(custom_sets$gene) & custom_sets$gene != "",]
+nrow(custom_sets)
+nrow(custom_sets_filtered)
+
+# Construct the term objects as GSEA input
+term2gene_custom <- custom_sets_filtered[,c("pathwayID", "gene")] 
+term2name_custom <- custom_sets_filtered[,c("pathwayID", "pathwayName")]
+
+# Perform GSEA
+
+#the input is a log2FC vector, named with gene name
+gse_custom=list()
+contrasts = unique(de.results.cond.Tcells$contrast)
+for (i in 1: length(contrasts)){
+  gene_list<-de.results.cond.Tcells$avg_log2FC[de.results.cond.Tcells$contrast == contrasts[i] ]
+  names(gene_list)<-de.results.cond.Tcells$gene_name[de.results.cond.Tcells$contrast == contrasts[i] ]
+  gene_list = na.omit(gene_list) # omit any NA values 
+  
+  gene_list = sort(gene_list, decreasing = TRUE)# sort the list in decreasing order (required for clusterProfiler)
+  
+  # RUN GSEA on custom terms
+  #gene ratio (‘GeneRatio’) what % of genes in a given gene set was found in your sample (e.g. E2F_targets GeneRatio 0.2 means: 20% of E2F_target were present in your input data, 80% were not)
+  #10% FDR
+  gse_custom[[i]] <- clusterProfiler::GSEA(geneList=gene_list, 
+                   TERM2GENE = term2gene_custom, 
+                   TERM2NAME = term2name_custom,
+                   pvalueCutoff = 0.1,
+                   minGSSize    = 3,
+                   maxGSSize    = 10000,
+                   verbose = TRUE,
+                   pAdjustMethod = "BH")
+  
+} 
+gse_custom_copy = gse_custom
+# gsea plot
+pdf(file=paste("compare_to_papers_GSEA_plots.pdf", sep=""), width=6, height=5)
+for (i in 1:length(contrasts))  {
+  if (nrow(gse_custom[[i]])==0) {next}
+  for (j in 1:length(gse_custom[[i]]$ID)){
+    regul = ifelse(gse_custom[[i]]$enrichmentScore[j] > 0, "activated", "supressed")
+    custom_plot = clusterProfiler::gseaplot(gse_custom[[i]], geneSetID = gse_custom[[i]]$ID[j],
+                                            title = paste0( "Gene set: ", gse_custom[[i]]$Description[j],"\n","is ",regul,
+                                                            " in ",contrasts[i],"\nadj. p-value = ", 
+                                                            signif(gse_custom[[i]]$p.adjust[j], digits = 2) ))
+    custom_plot[[1]] = custom_plot[[1]]+theme(axis.title = element_text(size=12), plot.title =  element_text(size=12))
+    custom_plot[[2]] = custom_plot[[2]]+theme(axis.title = element_text(size=12))
+    print(custom_plot)
+  }
+}
+dev.off()
+
+#how many are significant?
+lapply(gse_custom, nrow)
+#write table
+gse_custom.res=lapply(gse_custom, as.data.frame)
+#in case no significant values
+mock.gse_custom.res=data.frame("ID"=NA,"Description"=NA,"setSize"=NA,"enrichmentScore"=NA,
+                        "NES"=NA,"pvalue"=NA,"p.adjust"=NA, "qvalue"=NA,"rank"=NA,"leading_edge"=NA,
+                        "core_enrichment"=NA,"sample"=NA)
+for (i in (1:length(gse_custom.res))[unlist(lapply(gse_custom.res, nrow))==0]){
+  gse_custom.res[[i]] <-mock.gse_custom.res
+}
+for (i in 1:length(gse_custom.res)) {gse_custom.res[[i]]$sample=contrasts[i] }
+write.table( do.call(rbind,gse_custom.res), file=paste("output_GSEA_compare_to_papers.tsv", sep=""), row.names = FALSE, sep='\t',quote=FALSE )
+
+
+
+```
+## Custom sets part 2
+
+```{r GSEA_other_studies2, eval = FALSE}
+
+
+##### per custom gene set, overlap with genes found significant in at least one condition and plot heatmap
+custom_sets_filtered%>%
+  group_by(gene) %>%
+  summarise(paste(pathwayName, collapse = ",")) ->  gene2set 
+gene2set = data.frame(Gene.set=unlist(gene2set[,2]), row.names = unlist(gene2set[,1]))
+
+#significant in which comparison?
+FOLD_CHANGE=0.5
+PADJ=0.05
+gene2DE = list()
+
+for (i in 1: length(contrasts)){
+  res<-de.results.cond.Tcells[de.results.cond.Tcells$contrast == contrasts[i] ,]
+  
+  gene2DE[[i]] = res$gene_name[sapply(!is.na(res$avg_log2FC) & 
+                                          abs(res$avg_log2FC)>=FOLD_CHANGE &  
+                                          res$p_val_adj<PADJ,
+                                          isTRUE
+                                          ) ]
+  if(length(gene2DE[[i]]) == 0) {next} else {
+    gene2DE[[i]] = data.frame(gene = gene2DE[[i]], DE = contrasts[i])
+  }                                 
+  
+}
+gene2DE = do.call("rbind", gene2DE)
+gene2DE %>%
+  group_by(gene) %>%
+  summarise(paste(DE, collapse = ",")) ->  gene2DE 
+gene2DE = data.frame(row.names = unlist(gene2DE[,1]), DE = unlist(gene2DE[,2]))
+
+gene2annot = merge(gene2set,gene2DE, by.x = "row.names", by.y = "row.names", all = TRUE )
+gene2annot = data.frame(Gene.set=gene2annot[,2], row.names = gene2annot[,1], DE = gene2annot[,3])
+
+
+heatmap_custom_data = lfc.subset_norm[rownames(lfc.subset_norm) %in% 
+                                        na.omit(custom_sets_filtered$gene_name),]
+
+pdf(paste("13.","06062024","_compare_to_papers.significant.MGAT5KO.vs.Mock.pdf", sep=""),width=14,height=9)  
+ pheatmap(heatmap_custom_data, cluster_cols = FALSE, gaps_col = c(3,8),
+          annotation_row = gene2annot)
+
+dev.off()
+
+pdf(paste("14.","06062024","_compare_to_papers.significant.MGAT5KO.vs.Mock.pdf", sep=""),width=14,height=5) 
+for (i in unique(custom_sets_filtered$pathwayID)){
+  heatmap_custom_data = lfc.subset_norm[rownames(lfc.subset_norm) %in%
+                                          na.omit(custom_sets_filtered$gene_name[custom_sets_filtered$pathwayID==i]),]
+  heatmap_custom_data_order = order(gene2annot$DE[match(rownames(heatmap_custom_data), rownames(gene2annot))])
+  heatmap_custom_data = heatmap_custom_data[heatmap_custom_data_order,]
+  pheatmap(heatmap_custom_data, cluster_cols = FALSE, cluster_rows = FALSE, gaps_col = c(3,8),
+           annotation_row = gene2annot)
+}
+dev.off()
+
+unique(paste(custom_sets_filtered$pathwayID,custom_sets_filtered$pathwayName))
+#[1] "ID_1 upregulated in responders Fraietta_2018"           "ID_2 upregulated in non-responders Fraietta_2018"      
+#[3] "ID_3 upregulated upon long antigen exposure Good2021"   "ID_4 downregulated upon long antigen exposure Good2021"
+
+write.table(custom_sets, "06062024_custom_gene_sets.txt", sep = "\t", row.names = FALSE)
+
+```
+
+
+## Perform activation trajectory analysis with Slingshot
+https://nbisweden.github.io/workshop-archive/workshop-scRNAseq/2020-01-27/labs/compiled/slingshot/slingshot.html
+
+```{r activation_trajectory, eval = FALSE}
+#Save the objects as separate matrices for input in slingshot
+dimred <- data@reductions$umap@cell.embeddings
+clustering <- data$RNA_snn_res.1
+counts <- as.matrix(data@assays$RNA@counts[data@assays$RNA@var.features, ])
+
+#Define lineages
+suppressPackageStartupMessages({
+    library(slingshot)
+})
+
+# Run default Slingshot lineage identification
+set.seed(1)
+lineages <- getLineages(data = dimred, clusterLabels = clustering)
+
+lineages
+
+
+# Plot the lineages
+par(mfrow = c(1, 2))
+plot(dimred[, 1:2], col = pal[clustering], cex = 0.5, pch = 16)
+for (i in levels(clustering)) {
+    text(mean(dimred[clustering == i, 1]), mean(dimred[clustering == i, 2]), labels = i, font = 2)
+}
+plot(dimred[, 1:2], col = pal[clustering], cex = 0.5, pch = 16)
+lines(lineages, lwd = 3, col = "black")
+
+#Run default Slingshot
+set.seed(1)
+lineages <- getLineages(data = dimred,
+                        clusterLabels = clustering,
+                        #end.clus = c("11","7","10","9","5"), #define how many branches/lineages to consider
+                        start.clus = "0") #define where to start the trajectories
+#Define the start point and run again
+#Run default Slingshot
+set.seed(1)
+lineages <- getLineages(data = dimred,
+                        clusterLabels = clustering,
+                        #end.clus = c("11","7","10","9","5"), #define how many branches/lineages to consider
+                        start.clus = "0") #define where to start the trajectories
+
+lineages
+#Plot the lineages
+par(mfrow=c(1,2))
+plot(dimred[,1:2], col = pal[clustering],  cex=.5,pch = 16)
+for(i in levels(clustering)){ 
+  text( mean(dimred[clustering==i,1]),
+        mean(dimred[clustering==i,2]), labels = i,font = 2) }
+plot(dimred, col = pal[clustering],  pch = 16)
+lines(lineages, lwd = 3, col = 'black')
+
+#Define principal curves
+curves <- getCurves(lineages, approx_points = 300, thresh = 0.01, stretch = 0.8, allow.breaks = FALSE, shrink = 0.99)
+curves
+
+plot(dimred, col = pal[clustering], asp = 1, pch = 16)
+lines(curves, lwd = 3, col = "black")
+
+## Finding differentially expressed genes
+BiocParallel::register(BiocParallel::SerialParam())
+library(tradeSeq)
+
+# Removing some genes to speed up the computations for this tutorial
+filt_counts <- counts[rowSums(counts > 5) > ncol(counts)/100, ]
+dim(filt_counts)
+sce <- fitGAM(counts = as.matrix(filt_counts), sds = curves)
+
+plotGeneCount(curves, filt_counts, clusters = clustering, models = sce)
+
+# Define function to plot
+library(dplyr)
+plot_differential_expression <- function(feature_id) {
+    feature_id <- pseudotime_association %>% filter(pvalue < 0.05) %>% top_n(1, -waldStat) %>% pull(feature_id)
+    cowplot::plot_grid(plotGeneCount(curves, filt_counts, gene = feature_id[1], clusters = clustering, models = sce) + ggplot2::theme(legend.position = "none"), 
+        plotSmoothers(sce, as.matrix(counts), gene = feature_id[1]))
+}
+
+# Genes that change with pseudotime
+pseudotime_association <- associationTest(sce)
+pseudotime_association$fdr <- p.adjust(pseudotime_association$pvalue, method = "fdr")
+pseudotime_association <- pseudotime_association[order(pseudotime_association$pvalue), ]
+pseudotime_association$feature_id <- rownames(pseudotime_association)
+
+feature_id <- pseudotime_association %>% filter(pvalue < 0.05) %>% top_n(1, -waldStat) %>% pull(feature_id)
+plot_differential_expression(feature_id)
+
+# Genes that are different between lineages
+#Different at the end points, using diffEndTest
+#Different at the branching point, using earlyDETest
+#Different somewhere in pseudotime the branching point, using patternTest
+#Note that the last function requires that the pseudotimes between two lineages are aligned.
+different_end_association <- diffEndTest(sce)
+different_end_association$feature_id <- rownames(different_end_association)
+feature_id <- different_end_association %>% filter(pvalue < 0.05) %>% arrange(desc(waldStat)) %>% dplyr::slice(1) %>% pull(feature_id)
+plot_differential_expression(feature_id)
+branch_point_association <- earlyDETest(sce)
+branch_point_association$feature_id <- rownames(branch_point_association)
+
+feature_id <- branch_point_association %>% filter(pvalue < 0.05) %>% arrange(desc(waldStat)) %>% dplyr::slice(1) %>% pull(feature_id)
+plot_differential_expression(feature_id)
+
+
+```
+
+
+
+## Write down metadata and save session
+
+```{r save_objects, cache = FALSE}
+#save
+saveRDS(data1, file = "data1.rds")
+data1[[]]->meta.data1
+meta.data1$cell = rownames(meta.data1)
+writexl::write_xlsx(meta.data1, "metadata_cells.xlsx")
+
+save.image("backup.RData")
+
+create_loupe_from_seurat(data1, output_name = "seurat_exported", force = TRUE)
+
+```
+
+
+## END
+
+
