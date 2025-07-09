@@ -1,0 +1,429 @@
+---
+title: "SKOV3 cytokines"
+author: "Leander Meuris"
+date: "2023-02-06"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+# Introduction
+
+## Experimental setting
+
+The experiment looks at stimulation of different T-cell populations with different stimuli followed by measurement of cytokine production.
+There are different T-cell populations: - non transduced T-cells = NTC - CD70 nanoCAR mock cas9 transduced CAR T-cells, called WTCAR below.
+- CD70 nanoCAR MGAT5 KO CAR T-cells, called MGAT5CAR below.
+
+The stimulus of these cells was: - immunocult, a general T-cell stimulation mix.
+- THP1 cells, which provide a CD70-directed specific stimulation supposed to only activate CAR T-cells and not T-cells in general.
+THP1 cells are derived from a blood tumor (monocytic leukemia).
+- SKOV3cells, same as THP1 cells, but derived from a solid tumor instead.
+- no stimulation as the negative control (= a kind of 'blanco' measurment)
+
+Three different cytokines (IFN gamma, IL2 and TNF) were measured in these cells under the different stimuli.
+These are the three different outcome variables of the experiment.
+The outcome variables are measured as the fraction of CD3 positive cells that are also positive for an intracellular cytokine signal.
+
+Further, each setup was performed with T-cells from three different donors, and in technical duplicates as well.
+
+The aim is to see whether the glyco-engineering due to MGAT5 KO makes a difference for the cytokine production.
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(echo = FALSE, 
+                      eval = TRUE, 
+                      warning = FALSE, 
+                      message = FALSE)
+```
+
+```{r libraries}
+here::i_am("analysis/SKOV3_cytokines.Rmd")
+library(here)
+library(tidyverse)
+library(sandwich)
+library(broom)
+library(multcomp)
+filter <- dplyr::filter
+select <- dplyr::select
+```
+
+## Data
+
+TechRep: technical repeats Donor: T-cell donor 1, 2 or 3 Group: whether T-cells were non transduced (NTC), CD70 nanoCAR or CD70 nanoCAR with MGAT5 KO. Stimulation: No, Immunocult, THP1 or SKOV3 pctCD3_IFNg: the percentage of CD3 positive cells being positive for IFNg.
+pctCD3_IL2: the percentage of CD3 positive cells being positive for IL2.
+pctCD3_TNF: the percentage of CD3 positive cells being positive for TNF.
+nCountingBeads: the number of counting beads measured in a setup.
+In each vial, 10000 beads were added.
+Using these beads, the total numbers of cells in the vial can be calculated.
+nCD3_measured: the number of CD3 positive cells measured in a setup.
+nCD3_total: the calculated total number of CD3 positive cells in a setup, results from multiplying the counted number of cells with 10000 divided by the number of measured counting beads.
+Can be a fractional number.
+
+```{r data}
+cytokines <- readxl::read_xlsx(here("data/cytokines.xlsx"))
+```
+
+```{r combinedata}
+data <- cytokines %>%
+  mutate(Donor = factor(Donor),
+         Group = factor(Group,
+                        levels = c("NTC", "WTCAR", "MGAT5CAR")),
+         Stimulation = factor(Stimulation), 
+         TechRep = factor(TechRep)) %>%
+  arrange(Donor, Group)
+
+data_nostim <- data %>%
+  filter(Stimulation == 'No') %>%
+  group_by(Donor, Group) %>%
+  summarise(mCD3_IFNg_nostim = mean(pctCD3_IFNg), 
+            mCD3_IL2_nostim = mean(pctCD3_IL2),
+            mCD3_TNF_nostim = mean(pctCD3_TNF)) 
+
+data_mod <- left_join(data, data_nostim) %>%
+  filter(Stimulation %in% c('Immunocult', 'SKOV3', 'THP1')) %>%
+  filter(!Group %in% 'NTC') %>%
+  mutate(pctpos_IFNg = (1/100)*(pctCD3_IFNg-mCD3_IFNg_nostim), 
+         pctpos_IL2 = (1/100)*(pctCD3_IL2-mCD3_IL2_nostim),
+         pctpos_TNF = (1/100)*(pctCD3_TNF-mCD3_TNF_nostim)) %>%
+  select(Donor, Group, Stimulation, TechRep, 
+         pctpos_IFNg, pctpos_IL2, pctpos_TNF, 
+         nCD3_measured) %>%
+  mutate(across(starts_with('nCD3')) %>% round(.,0)) %>%
+  mutate(across(starts_with('pct')) %>% round(.,3))
+```
+
+# Exploratory data analysis
+
+## Mean structure
+
+First, we have a look at the data as they are provided (without blanco correction).
+
+```{r EDA}
+data %>%
+  ggplot(aes(x=Group, y = pctCD3_IFNg)) +
+  geom_point(alpha = 0.5) +
+  facet_grid(Donor~Stimulation) +
+  theme_bw()
+
+data %>%
+  ggplot(aes(x=Group, y = pctCD3_IL2)) +
+  geom_point(alpha = 0.5) +
+  facet_grid(Donor~Stimulation) +
+  theme_bw()
+
+data %>%
+  ggplot(aes(x=Group, y = pctCD3_TNF)) +
+  geom_point(alpha = 0.5) +
+  facet_grid(Donor~Stimulation) +
+  theme_bw()
+```
+
+Then we look at the blanco-corrected data (figures below) that are also meant to do the modeling, so focusing on the CAR cells, leaving the NTC out.
+We do this because the NTC's behave differently under the Immunocult versus SKOV3 or THP1 stimuli.
+This is so by design, since THP1 and SKOV3 are specific stimuli that only are supposed to work for CD70 nanoCAR positive cells while immunocult is aspecific and should work for all CD3+ cells.
+
+From the graphs we can see that the technical repeats are always pretty close together.
+MGAT5 KO mostly results in somewhat higher fractions of the cells being positive for cytokine production.
+This is the case for IL2 and for TNF with IFNg being the exception.
+Here we see that under SKOV3 stimulation, the production is somewhat lower in MGAT5 KO cells, specifically in donor 3 and maybe donor 2 but not in donor 1.
+
+```{r}
+data_mod %>%
+  ggplot(aes(x=Group, y = pctpos_IFNg, color = TechRep)) +
+  geom_point(alpha = 0.5) +
+  facet_grid(Donor~Stimulation) +
+  theme_bw()
+
+data_mod %>%
+  ggplot(aes(x=Group, y = pctpos_IL2, color = TechRep)) +
+  geom_point(alpha = 0.5) +
+  facet_grid(Donor~Stimulation) +
+  theme_bw()
+
+data_mod %>%
+  ggplot(aes(x=Group, y = pctpos_TNF, color = TechRep)) +
+  geom_point(alpha = 0.5) +
+  facet_grid(Donor~Stimulation) +
+  theme_bw()
+```
+
+## Rough exploratory calculations
+
+What are the percentages of cytokine positive cells in each group and what is the difference between the groups?
+
+```{r}
+group_pct <- data_mod %>%
+  group_by(Group) %>%
+  summarise(IFNg = mean(pctpos_IFNg), 
+            IL2 = mean(pctpos_IL2), 
+            TNF = mean(pctpos_TNF)) %>%
+  mutate(across(where(is.numeric)) %>% round(.,3))
+
+rbind(group_pct, 
+cbind(Group = 'MGAT5KO - WTCAR', group_pct[2,2:4]-group_pct[1,2:4]))
+
+```
+
+We see a difference of about 5 to 7 % in the number of cytokine producing cells upon MGAT5 engineering, depending on the cytokine.
+
+Next, we have a look at the percentages again but split the data by Stimulation strategy.
+
+```{r}
+group_pct <- data_mod %>%
+  group_by(Group, Stimulation) %>%
+  summarise(IFNg = mean(pctpos_IFNg), 
+            IL2 = mean(pctpos_IL2), 
+            TNF = mean(pctpos_TNF)) %>%
+  mutate(across(where(is.numeric)) %>% round(.,3))
+group_pct
+```
+
+We have a look at the differences between MGAT5 engineered and WT CAR cells, split up by stimulation strategy.
+
+```{r}
+rbind(
+  cbind(Group = 'MGAT5KO - WTCAR', Stimulation = 'Immunocult',
+        group_pct[4,3:5]-group_pct[1,3:5]),
+  cbind(Group = 'MGAT5KO - WTCAR', Stimulation = 'SKOV3',
+        group_pct[5,3:5]-group_pct[2,3:5]),
+  cbind(Group = 'MGAT5KO - WTCAR', Stimulation = 'THP1',
+        group_pct[6,3:5]-group_pct[3,3:5])
+)
+
+```
+
+Splitting the data by stimulation strategy results in a positive difference for any type of stimulation (so MGAT5 engineering always results in higher fractions of cytokine producing cells) when the data are averaged over the three donors.
+We see that the difference becomes small for IFNg in SKOV3 stimulation (due to donor 3 behaving different).
+
+# Modeling
+
+For percentages, we usually resort to logistic regression.
+Since we have many measurements (each cell is considered a measurement in this approach), pretty much any effect will probably be significant.
+On the other hand, a linear regression might be ok here, since we will be looking at percentages, and we are a long way away from the boundaries (0% or 100%) with the cases considered.
+We try this approach first and have a look at the residuals to see if it's ok.
+
+## TNF
+
+```{r}
+modTNF_1 <- lm(pctpos_TNF ~ (Group+Stimulation+Donor)^2, data = data_mod)
+modTNF_2 <- update(modTNF_1, .~.-Group:Stimulation)
+modTNF_3 <- update(modTNF_1, .~.-Group:Donor)
+modTNF_4 <- update(modTNF_1, .~.-Stimulation:Donor)
+anova(modTNF_1, modTNF_2) # just significant
+anova(modTNF_1, modTNF_3) # significant
+anova(modTNF_1, modTNF_4) # significant
+
+mod <- modTNF_1
+```
+
+Model building suggests to keep Group, Stimulation and Donor effects and all twoway interactions.
+This means that the effect of MGAT5 engineering depends on both the donor and the stimulation and also that the effect of stimulation on cytokine production differs between the donors.
+Before we go to inference, we check the model.
+
+```{r}
+plot(mod)
+broom::tidy(mod) %>% 
+  mutate(p.value = ifelse(p.value < 0.001, '<0.001', round(p.value, 3))) %>%
+  mutate(across(where(is.numeric)) %>% round(., 3))
+```
+
+Residuals look OK, except for some heteroscedasticity and some mild non-normality.
+We will use heteroscedasticity consistent (sandwich) estimators.
+Now for the inference.
+We calculate the effect of MGAT5 engineering versus no MGAT5 engineering, averaged over the three donors and the three different stimulation strategies from the model.
+
+```{r}
+L <- rbind(c(0,1,0,0,0,0,1/3,1/3,1/3,1/3,0,0,0,0),
+           c(0,1,0,0,0,0,0,0,1/3,1/3,0,0,0,0),
+           c(0,1,0,0,0,0,1,0,1/3,1/3,0,0,0,0),
+           c(0,1,0,0,0,0,0,1,1/3,1/3,0,0,0,0))
+rownames(L) <- c("MGAT5 effect on TNF, averaged over donors and stimulation strategy", 
+                 'MGAT5 effect on TNF, with Immunocult stimulation, averaged over donors',
+                 'MGAT5 effect on TNF, with SKOV3 stimulation, averaged over donors',
+                 'MGAT5 effect on TNF, with THP1 stimulation, averaged over donors')
+colnames(L) <- names(mod$coefficients)
+
+TNF <- left_join(
+    glht(mod, linfct = L, vcov = vcovHC) %>% summary %>% tidy,
+    glht(mod, linfct = L, vcov = vcovHC) %>% confint %>% tidy
+  ) %>%
+    mutate(`Estimate (%)` = estimate*100,
+           `Std. error (%)` = std.error*100,
+           `95% CI, lower` = conf.low*100,
+           `95% CI, upper` = conf.high*100,
+           `Statistic` = statistic,
+           `Adj. p-value` = ifelse(adj.p.value < 0.001, 
+                                "<0.001", 
+                                round(adj.p.value, 3))%>% as.character) %>%
+    mutate(across(where(is.numeric)) %>% round(., 2)) %>%
+    dplyr::select(Contrast = contrast,
+           `Estimate (%)`,
+           `Std. error (%)`,
+           `95% CI, lower`,
+           `95% CI, upper`,
+           `Statistic`,
+           `Adj. p-value`)
+
+knitr::kable(TNF) %>% 
+  kableExtra::kable_styling()
+```
+
+We see a significant effect of MGAT5 engineering (p value = `r TNF[[1,7]]`) resulting in a change in the number of cytokine expressing cells of `r TNF[[1,2]]`% with a 95% confidence interval of `r TNF[[1,4]]`% to `r TNF[[1,5]]`%. Since the model contains an interaction effect of Group with Donor and Group with Stimulation, this means that the effect shown here is averaged over the three donors and the three stimulation strategies.
+Underneath, the model assumes that the MGAT5 engineering effect is different between the donors and between the stimulation strategies. Consequently, the table also gives effect estimates in each separate stimulation strategy. 
+
+## IL2
+
+```{r}
+modIL2_1 <- lm(pctpos_IL2 ~ (Group+Stimulation+Donor)^2, data = data_mod)
+modIL2_2 <- update(modIL2_1, .~.-Group:Stimulation)
+modIL2_3 <- update(modIL2_1, .~.-Group:Donor)
+modIL2_4 <- update(modIL2_1, .~.-Stimulation:Donor)
+anova(modIL2_1, modIL2_2) # significant
+anova(modIL2_1, modIL2_3) # significant
+anova(modIL2_1, modIL2_4) # significant
+
+mod <- modIL2_1
+```
+
+Model building suggests to keep Group, Stimulation and Donor effects and all twoway interactions.
+This means that the effect of MGAT5 engineering depends on both the donor and the stimulation and also that the effect of stimulation on cytokine production differs between the donors.
+Before we go to inference, we check the model.
+
+```{r}
+plot(mod)
+broom::tidy(mod) %>% 
+  mutate(p.value = ifelse(p.value < 0.001, '<0.001', round(p.value, 3))) %>%
+  mutate(across(where(is.numeric)) %>% round(., 3))
+```
+
+Residuals look OK, except for again some heteroscedasticity (less than for TNF) and some mild non-normality (also less than for TNF).
+We will use heteroscedasticity consistent (sandwich) estimators.
+Now for the inference.
+We calculate the effect of MGAT5 engineering versus no MGAT5 engineering, averaged over the three donors and the three different stimulation strategies from the model.
+
+```{r}
+L <- rbind(c(0,1,0,0,0,0,1/3,1/3,1/3,1/3,0,0,0,0),
+           c(0,1,0,0,0,0,0,0,1/3,1/3,0,0,0,0),
+           c(0,1,0,0,0,0,1,0,1/3,1/3,0,0,0,0),
+           c(0,1,0,0,0,0,0,1,1/3,1/3,0,0,0,0))
+rownames(L) <- c("MGAT5 effect on IL2, averaged over donors and stimulation strategy", 
+                 'MGAT5 effect on IL2, with Immunocult stimulation, averaged over donors',
+                 'MGAT5 effect on IL2, with SKOV3 stimulation, averaged over donors',
+                 'MGAT5 effect on IL2, with THP1 stimulation, averaged over donors')
+colnames(L) <- names(mod$coefficients)
+
+IL2 <- left_join(
+    glht(mod, linfct = L, vcov = vcovHC) %>% summary %>% tidy,
+    glht(mod, linfct = L, vcov = vcovHC) %>% confint %>% tidy
+  ) %>%
+    mutate(`Estimate (%)` = estimate*100,
+           `Std. error (%)` = std.error*100,
+           `95% CI, lower` = conf.low*100,
+           `95% CI, upper` = conf.high*100,
+           `Statistic` = statistic,
+           `Adj. p-value` = ifelse(adj.p.value < 0.001, 
+                                "<0.001", 
+                                round(adj.p.value, 3)) %>% as.character) %>%
+    mutate(across(where(is.numeric)) %>% round(., 2)) %>%
+    dplyr::select(Contrast = contrast,
+           `Estimate (%)`,
+           `Std. error (%)`,
+           `95% CI, lower`,
+           `95% CI, upper`,
+           `Statistic`,
+           `Adj. p-value`)
+
+knitr::kable(IL2) %>% 
+  kableExtra::kable_styling()
+```
+
+We see a significant effect of MGAT5 engineering (p value = `r IL2[[1,7]]`) resulting in a change in the number of cytokine expressing cells of `r IL2[[1,2]]`% with a 95% confidence interval of `r IL2[[1,4]]`% to `r IL2[[1,5]]`%. Since in general, the IL2 positive cells percentages are somewhat lower, this represents a larger relative change.
+
+## IFNg
+
+```{r}
+modIFNg_1 <- lm(pctpos_IFNg ~ (Group+Stimulation+Donor)^2, data = data_mod)
+modIFNg_2 <- update(modIFNg_1, .~.-Group:Stimulation)
+modIFNg_3 <- update(modIFNg_1, .~.-Group:Donor)
+modIFNg_4 <- update(modIFNg_1, .~.-Stimulation:Donor)
+anova(modIFNg_1, modIFNg_2) # not significant
+anova(modIFNg_1, modIFNg_3) # significant
+anova(modIFNg_1, modIFNg_4) # significant
+
+modIFNg_5 <- update(modIFNg_2, .~.-Group:Donor)
+modIFNg_6 <- update(modIFNg_2, .~.-Stimulation:Donor)
+anova(modIFNg_2, modIFNg_5) # significant
+anova(modIFNg_2, modIFNg_6) # significant
+```
+
+Model building suggests to keep Group, Stimulation and Donor effects and the twoway interactions Group:Donor and Stimulation:Donor but not Group:Stimulation. However, if we want to make estimates separately for each stimulation strategy, it may be better to keep the interaction effect in. If we do this, we do not force the estimation of the mgat5 effect to be the same for each stimulation strategy.
+
+```{r}
+mod <- update(modIFNg_1)
+plot(mod)
+broom::tidy(mod) %>% 
+  mutate(p.value = ifelse(p.value < 0.001, '<0.001', round(p.value, 3))) %>%
+  mutate(across(where(is.numeric)) %>% round(., 3))
+```
+
+Residuals look OK, except for some heteroscedasticity and some mild non-normality.
+We will use heteroscedasticity consistent (sandwich) estimators.
+Now for the inference. We calculate the effect of MGAT5 engineering versus no MGAT5 engineering, averaged over the three donors.
+
+```{r}
+L <- rbind(c(0,1,0,0,0,0,1/3,1/3,1/3,1/3,0,0,0,0),
+           c(0,1,0,0,0,0,0,0,1/3,1/3,0,0,0,0),
+           c(0,1,0,0,0,0,1,0,1/3,1/3,0,0,0,0),
+           c(0,1,0,0,0,0,0,1,1/3,1/3,0,0,0,0))
+rownames(L) <- c("MGAT5 effect on IFNg, averaged over donors and stimulation strategy", 
+                 'MGAT5 effect on IFNg, with Immunocult stimulation, averaged over donors',
+                 'MGAT5 effect on IFNg, with SKOV3 stimulation, averaged over donors',
+                 'MGAT5 effect on IFNg, with THP1 stimulation, averaged over donors')
+colnames(L) <- names(mod$coefficients)
+
+IFNg <- left_join(
+    glht(mod, linfct = L, vcov = vcovHC) %>% summary %>% tidy,
+    glht(mod, linfct = L, vcov = vcovHC) %>% confint %>% tidy
+  ) %>%
+    mutate(`Estimate (%)` = estimate*100,
+           `Std. error (%)` = std.error*100,
+           `95% CI, lower` = conf.low*100,
+           `95% CI, upper` = conf.high*100,
+           `Statistic` = statistic,
+           `Adj. p-value` = ifelse(adj.p.value < 0.001, 
+                                "<0.001", 
+                                round(adj.p.value, 3))%>% as.character) %>%
+    mutate(across(where(is.numeric)) %>% round(., 2)) %>%
+    dplyr::select(Contrast = contrast,
+           `Estimate (%)`,
+           `Std. error (%)`,
+           `95% CI, lower`,
+           `95% CI, upper`,
+           `Statistic`,
+           `Adj. p-value`)
+
+knitr::kable(IFNg) %>% 
+  kableExtra::kable_styling()
+```
+
+In this case, the Group:Stimulation interaction is not significant, but we still kept it in the model to enable estimation of the MGAT5 effect in each stimulation strategy separately. We still average over the donors as before.
+We see a significant effect of MGAT5 engineering (p value = `r IFNg[[1,7]]`) resulting in a change in the number of cytokine expressing cells of `r IFNg[[1,2]]`% with a 95% confidence interval of `r IFNg[[1,4]]`% to `r IFNg[[1,5]]`%.
+We see that the confidence interval is widest here, which is due to the variation under SKOV3 stimulation, where we see that the MGAT5 effect is different between the donors. In Donor 3, the MGAT5 engineering actually results in a lower number of IFNg-producing cells. This is also reflected in the fact that the MGAT5 effect is not significant in under SKOV3 stimulation (adjusted p-value = `r IFNg[[3,7]]`).
+
+# Methods
+
+To analyze the data of the fractions of cytokine-producing cells upon MGAT5 glycoengineering, considered the control setup in which cells were not stimulated to represent a background signal.
+We subtracted the mean percentage cytokine positive cells measured in the two technical repeats of non-stimulated cells from the corresponding percentage of cytokine positive cells in the stimulated setups (corresponding means the setup with the same CAR engineering and donor).
+Further, to facilitate model building, we only considered mock CAR versus MGAT5 KO CAR engineering since SKOV3 and THP1 stimulation are profoundly different for the NTC setup compared to cells containing the CD70 nanoCAR construct.
+This difference is by design and we are not interested in its effects in this context.
+For each cytokine, we built an ANOVA model in R [ref R], with Stimulation, Donor and Group as main effects (all coded as categorical) and allowing for all two-way interactions.
+All two-way interactions proved to be significant in the IL2 and TNF models while the Group:Stimulation interaction was the only non-significant interaction in the IFNg model.
+Model terms were tested via F tests.
+The effect of MGAT5 engineering, averaged over donors and stimulation strategies was obtained from each final model using the multcomp package [ref multcomp] with heteroscedasticity-consistent sandwich estimators [ref sandwich 2004 en 2020].
+
+```{r}
+citation()
+citation('multcomp')
+citation('sandwich')
+```

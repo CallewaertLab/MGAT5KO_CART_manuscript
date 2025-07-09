@@ -1,0 +1,287 @@
+---
+title: "Raji model cell counts"
+author: "L. Meuris"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+here::i_am("analysis/Raji_CellCounts.Rmd")
+library(here)
+library(readxl)
+library(writexl)
+library(tidyverse)
+library(ggh4x)
+options(tibble.print_max = Inf, tibble.print_min = Inf)
+```
+
+# Description of experiments
+
+Purpose of the experiment is to look at the effect of MGAT5 engineering in CART-cells in a mouse tumor model. The model uses Raji cells, which create blood tumors of the Burkitt's lymphoma type. These cells are CD19, CD20 and CD70 positive.  
+
+The experiment has the following timeline:
+
+  - day 0: injection of 500 000 Raji cells IV
+  - day 6: IVIS baseline measurement
+  - day 7: treatment (CAR T injection ivin different doses and controls)
+  - around day 135: rechallenge with new dose of Raji cells IV
+  
+The mice are followed up via body weight measurements and IVIS data and some blood is taken at several timepoints to count the number of CAR cells (GFP+) in the blood. There are 4 experiments, each with 5 mice per group. 
+
+Experiment 51:
+
+  - PBS: no cells given
+  - NTC: 4 million cells donor T-cells, no CAR T cells
+  - CD70 CART WT 4 million cells
+  - CD70 CART MGAT5 4 million cells
+  - CD70 CART WT 2 million cells
+  - CD70 CART MGAT5 2 million cells
+ 
+  
+Experiment 62 and 68:
+
+  - NTC: 4 million cells donor T-cells, no CAR T cells
+  - CD70 CART WT 4 million cells
+  - CD70 CART MGAT5 4 million cells
+
+  
+Experiment 74: used 6 mice per group, and no CD19 CART cells:
+
+  - NTC: 4 million cells donor T-cells, no CAR T cells
+  - CD70 CART WT 4 million cells
+  - CD70 CART MGAT5 4 million cells
+ 
+
+Summarizing we can say that: 
+
+  1) The target is CD70
+  2) different amounts of CART cells have been injected; 0.5, 2 or 4 million
+  3) CART cells were either engineered or not to have MGAT5 knocked out
+  
+There was a rechallenge part to experiments 51 and 74, but not to 62 and 68. 
+A rechallenge means that tumor cells were administered again after a set period.
+
+# Data
+
+The data are from a flow cytometry experiment which analyzed the number of CART cells in the blood of mice in the Raji tumor model treated with different versions of CAR T-cells or controls. The following variables are in the dataset:
+
+  - Experiment: from which experiment are the data (E51, E62, E68 and E74)
+  - Day: at which day was blood sampled? We have 2 or 
+   timepoints, depending on the experiment. Around day 20, around day 90, around day 150 and around day 200.
+  - Treatment: mice received no CAR T-cells (PBS, NTC, None), CAR T-cells but no MGAT5 engineering (CD70 nanoCAR-neg and CD70 nanoCAR-WT) or CAR T-cells which were MGAT5 KO (CD70 nanoCAR-MGAT5 KO). Specifically in experiment 51, there was a test for doses of treatment. We will remove those cases where the dose does not correspond to the other experiments. 
+  - CellCount: the number of cells found in a spleen or in 1 ul blood. 
+  - Mouse: refers to the ID of the mouse in the experiment.  
+
+```{r}
+data <- read_xlsx(here('data/data_counts_cleaned.xlsx'))
+```
+
+Cleaning: remove sentinel mice
+
+```{r}
+data <- data %>%
+  filter(Treatment != 'sentinel')
+```
+
+Cleaning: remove treatments in exp 51 that were for dose finding and not repeated in other experiments.
+This is: remove treatments with 2 million cells for CD70.
+Then strip the dose information from the Treatment variable.
+
+```{r}
+data <- data %>%
+  filter(!Treatment %in% c('CD70 WT CAR - 2', 'CD70 M5KO CAR - 2')) %>%
+  mutate(Treatment = str_remove(Treatment, ' - \\d(\\.\\d)?'))
+```
+
+Remove 'Raji +' from some treatment names. 
+
+```{r}
+data <- data %>%
+  mutate(Treatment = str_remove(Treatment, 'Raji \\+ '))
+```
+
+
+What is left now? 
+
+```{r}
+data$Treatment %>% unique
+```
+
+Rename treatments that are identical but have a different name to have the same names.
+
+```{r}
+data <- data %>%
+  mutate(Treatment = case_when(
+    Treatment == 'NTC' ~ 'NTC',
+    Treatment %in% c('CD70 WT CAR', 'CD70 nanoCAR - neg ctrl')  ~ 'CD70 nanoCAR MGAT5 WT',
+    Treatment %in% c('CD70 M5KO CAR', 'CD70 nanoCAR - MGAT5 KO')  ~ 'CD70 nanoCAR MGAT5 KO'
+  ))
+```
+
+What do we have now? 
+
+```{r}
+data$Treatment %>% unique
+```
+
+Make a group variable, indicating no CAR, CAR or CAR with MGAT5 KO.
+Make a target variable, indicating control, CD20 or CD70
+
+```{r}
+data <- data %>%
+  mutate(
+    Group = factor(case_when(
+      Treatment %in% c('NTC') ~ 'Control',
+      Treatment %in% c('CD70 nanoCAR MGAT5 WT', 'CD20 nanoCAR MGAT5 WT') ~ 'CAR',
+      Treatment %in% c('CD70 nanoCAR MGAT5 KO', 'CD20 nanoCAR MGAT5 KO') ~ 'MGAT5KO_CAR'), 
+      levels = c('Control', 'CAR', 'MGAT5KO_CAR'), 
+      labels = c('NTC', 'MGAT5 WT', 'MGAT5 KO')),
+    Target = factor(case_when(
+      Treatment %in% c('NTC') ~ 'NTC', 
+      Treatment %in% c('CD20 nanoCAR MGAT5 WT', 'CD20 nanoCAR MGAT5 KO') ~ 'CD20',
+      Treatment %in% c('CD70 nanoCAR MGAT5 WT', 'CD70 nanoCAR MGAT5 KO') ~ 'CD70')),
+    TimePoint = factor(case_when(
+      Day < 40 ~ 1, 
+      between(Day, 40, 100) ~ 2,
+      between(Day, 100, 180) ~ 3,
+      Day > 180 ~ 4)),
+    Experiment = factor(
+      Experiment,
+      levels = c('E51', 'E62', 'E68', 'E74')))
+```
+
+We note that cell counts can be lower than 1 if we look in blood. 
+For cell counts we would like to use a Poisson or Negative binomial model, however, these don't work well with non-integers. So we will work with the number of cells per ml blood and round to the nearest integer. 
+
+```{r}
+data <- data %>%
+  mutate(CellCount = (1000*CellCount_pul) %>% round(., 0))
+```
+
+# Exploratory data analysis
+
+Plot the data by experiment and timepoint.
+We use a pseudo-log-scale y axis to better see differences. 
+(A pseudo log-scale uses a log scale for large values but gradually becomes a linear scale for small values)
+
+## Plot for CD70
+
+```{r}
+CD70_box <- data %>%
+  filter(Target %in% c('NTC', 'CD70')) %>%
+  filter(TimePoint %in% c(1,2)) %>%
+  ggplot(aes(x = Group, y = CellCount, color = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.5) +
+  facet_grid2(Experiment~TimePoint, scales = 'free_y') +
+  scale_y_continuous(trans = 'sqrt') +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  theme_bw() +
+  scale_colour_manual(values = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  labs(y = 'Cells per ml of blood') +
+  ggtitle('CD70 nanoCAR, counts of GFP+ cells') +
+  scale_y_facet(Experiment == 'E51', 
+                breaks = c(0,200,400,600,800,1000),
+                labels = (c(0,200,400,600,800,1000))^2) +
+  scale_y_facet(Experiment == 'E62', 
+                breaks = c(0,20,40,60,80,100),
+                labels = (c(0,20,40,60,80,100))^2) +
+  scale_y_facet(Experiment == 'E68', 
+                breaks = c(0,50,100,150,200,250),
+                labels = (c(0,50,100,150,200,250))^2) +
+  scale_y_facet(Experiment == 'E74', 
+                breaks = c(0,40,80,120,160,200),
+                labels = (c(0,40,80,120,160,200))^2) +
+  theme(panel.grid.minor = element_blank())
+
+ggsave(here("output/BloodBox_Raji_CD70.pdf"), CD70_box,
+       device = "pdf", height = 8, width = 10, dpi=600)
+
+CD70_box
+```
+
+Number of mice:
+
+```{r}
+data %>%
+  filter(Target %in% c('NTC', 'CD70')) %>% 
+  group_by(TimePoint, Group, Experiment) %>%
+  count()
+```
+
+We will now continue with modeling the counts: 
+  - We model CD20 and CD70 data separately, each time using the same NTC.
+  - We model each time-point separately. 
+  - We only make a contrast for MGAT5 WT vs MGAT5 KO. 
+  
+We will always use a pre-defined model: 
+
+CellCount ~ Group*Experiment
+
+This means we have a main effect for group (factor with 3 levels: NTC, MGAT5 WT, MGAT5 KO) and for experiment (factor with 4 levels, i.e. 4 experiments).
+
+The interaction term in the model is warranted in the light of donor effects. Each experiment uses another donor for the T-cells. As such we may expect different effects in different experiments. 
+
+We will model these data with a quasipoisson model, which is suited for overdispersed count data and uses a log-link. 
+
+# Models
+
+plot data for which we are going to test
+
+```{r}
+data %>%
+  filter(Target %in% c('CD70')) %>%
+  filter(TimePoint %in% c(1,2)) %>%
+  ggplot(aes(x = Group, y = CellCount, color = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2) +
+  facet_grid(Target~Experiment*TimePoint) +
+  scale_y_sqrt() +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  theme_bw() +
+  labs(y = 'Cells per ml of blood') +
+  theme(panel.grid.minor = element_blank())
+```
+
+
+```{r}
+modeldata <- data %>%
+  filter(Target %in% c('CD70')) %>%
+  filter(TimePoint %in% c(1,2)) %>%
+  group_by(Target, Experiment, TimePoint) %>%
+  nest() %>%
+  mutate(data = purrr::map(data, ~.x %>% droplevels()))
+```
+
+```{r}
+modeldata <- modeldata %>%
+  rowwise() %>%
+  filter(length(unique(data$Treatment))==2) %>%
+  mutate(model = list(glm(CellCount ~ Group, data = data, family = quasipoisson)),
+         logFC = model$coefficients['GroupMGAT5 KO'] %>% as.numeric, 
+         pval = summary(model)$coefficients['GroupMGAT5 KO','Pr(>|t|)'])
+
+modeldata %>%
+  select(Experiment, Target, TimePoint, pval) %>%
+  arrange(Target, Experiment, TimePoint) %>%
+  mutate(pvals = ifelse(pval<0.001, '<0.001', round(pval, 3))) %>%
+  write_xlsx(here('output/Raji_M5KOvsWT_CellCount_tests.xlsx'))
+
+modeldata
+```
+
+
+# Materials and Methods
+
+To analyse the FACS-based cell-count data of 4 separate experiments (i.e. donors), we ran separate models for each combination of target (CD20 and CD70), donor and time-point (1, 2). Note that we did not always have data for all settings available. 
+
+We ran quasipoisson models in R [ref], using the glm function with Cell Counts per ml of blood as the outcome variable and Group (MGAT5KO vs WT) as predictor. The presented p-values were then extracted from the model.
+
+```{r}
+citation()
+```
+

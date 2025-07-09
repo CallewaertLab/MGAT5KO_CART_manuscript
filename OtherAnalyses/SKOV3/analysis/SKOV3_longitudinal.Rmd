@@ -1,0 +1,1133 @@
+---
+title: "SKOV3, combined Longitudinal Data on MGAT5 CART cells"
+author: "Leander Meuris"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+here::i_am("analysis/SKOV3_longitudinal.Rmd")
+library(here)
+library(tidyverse)
+library(scales)
+library(glmmTMB)
+library(splines)
+library(DHARMa)
+library(broom.mixed)
+library(emmeans)
+library(writexl)
+options(knitr.kable.NA = "")
+```
+
+Define nth power transformation
+```{r}
+power_trans <- function(power){
+   trans_new("power",
+             transform = function(y){
+                if(power != 0){
+                   yt <- sign(y) * abs(y)^(power)
+                } else {
+                   yt = y
+                }
+                return(yt)
+             },
+             inverse = function(yt){
+                if(power != 0){
+                   y <- yt^(1/(power))
+                } else {
+                   y <- yt
+                   
+                }
+                return(y)
+             },
+             domain = c(-Inf, Inf)
+             )
+}
+```
+
+
+# Data
+
+```{r}
+day_challenge <- 0 
+day_CARtrt <- 13 
+day_rechallenge_exp30 <- 87 
+day_rechallenge_exp32 <- 90
+day_rechallenge_exp43 <- 90 
+```
+
+```{r}
+metadata1 <- readxl::read_xlsx(here("data/metadata1.xlsx"))
+Exp30P <- readxl::read_xlsx(here("data/Exp30_PrimaryTumor.xlsx")) %>%
+  mutate(Tumor = "Primary Tumor")
+Exp30S <- readxl::read_xlsx(here("data/Exp30_SecondaryTumor.xlsx")) %>%
+  mutate(Tumor = "Secondary Tumor")
+Exp32P <- readxl::read_xlsx(here("data/Exp32_PrimaryTumor.xlsx")) %>%
+  mutate(Tumor = "Primary Tumor")
+Exp32S <- readxl::read_xlsx(here("data/Exp32_SecondaryTumor.xlsx")) %>%
+  mutate(Tumor = "Secondary Tumor")
+
+metadata2 <- readxl::read_xlsx(here("data/metadata2.xlsx"))
+Exp43P <- readxl::read_xlsx(here("data/Exp43_PrimaryTumor.xlsx")) %>%
+  mutate(Tumor = "Primary Tumor")
+Exp43S <- readxl::read_xlsx(here("data/Exp43_SecondaryTumor.xlsx")) %>%
+  mutate(Tumor = "Secondary Tumor")
+```
+
+```{r}
+ExpData <- tibble(dataset = c("Exp30P", "Exp30S", "Exp32P", "Exp32S", "Exp43P", "Exp43S"),
+                  data = list(Exp30P, Exp30S, Exp32P, Exp32S, Exp43P, Exp43S))
+
+ExpData <- ExpData %>%
+  rowwise() %>%
+  mutate(datalong = list(
+    pivot_longer(data, cols = -c("Experiment", "Day", "Tumor"),
+                 names_to = "Mouse", values_to = "TumorVol") %>%
+      mutate(Mouse = paste0("E", Experiment, "M", Mouse)))) %>%
+  select(-data) %>%
+  unnest(cols = datalong) %>%
+  select(Mouse, Experiment, Mouse, Tumor, Day, TumorVol)
+
+metadata1 <- metadata1 %>%
+  mutate(Mouse = as.character(paste0('E', Experiment, 'M', Mouse)))
+
+metadata2 <- metadata2 %>%
+  mutate(Mouse = as.character(paste0('E', Experiment, 'M', Mouse)))
+
+metadata <- bind_rows(metadata1, metadata2) %>%
+  mutate(Mouse = as.factor(Mouse))
+
+data <- left_join(ExpData, metadata) %>%
+  filter(Donor != 'E43_X') %>%
+  mutate(Experiment = factor(Experiment, 
+                             levels = c(30,32,43), 
+                             labels = c('Donor A', 'Donor B', 'Donor C')),
+         Tumor = factor(Tumor),
+         Treatment = factor(Treatment),
+         logTumorVol = log2(TumorVol + 0.0625),
+         DayRechallenge = case_when(
+           Experiment == 'Donor A' ~ day_rechallenge_exp30,
+           Experiment == 'Donor B' ~ day_rechallenge_exp32,
+           Experiment == 'Donor C' ~ day_rechallenge_exp43),
+         Group = factor(
+           case_when(Treatment %in% c("Ctrl", "NTC", 'None', 'WT') ~ "No_CAR",
+                     Treatment %in% c("CAR_NoCrispr", "CAR_MockCrispr") ~ "CAR",
+                     Treatment == "CAR_MGAT5Crispr" ~ "CAR_MGAT5"),
+           levels = c("No_CAR", "CAR", "CAR_MGAT5"), 
+           labels = c('Untreated', 'CD70 nanoCAR', 'CD70 nanoCAR - MGAT5 KO')),
+         Period = factor(
+           case_when(Tumor == 'Primary Tumor' & Day<DayRechallenge ~ 
+                       "Primary Tumor, Pre Rechallenge",
+                     Tumor == 'Primary Tumor' & Day>=DayRechallenge ~ 
+                       "Primary Tumor, Post Rechallenge",
+                     Tumor == 'Secondary Tumor' & Day>=DayRechallenge ~ 
+                       "Secondary Tumor, Post Rechallenge"),
+           levels = c("Primary Tumor, Pre Rechallenge",
+                      "Primary Tumor, Post Rechallenge",
+                      "Secondary Tumor, Post Rechallenge")))
+
+rm(Exp30P, Exp30S, Exp32P, Exp32S, Exp43P, Exp43S, ExpData, metadata, metadata1, metadata2)
+
+data <- data %>%
+  filter(!is.na(TumorVol))
+
+#data %>% writexl::write_xlsx(here('output/longitudinaldata.xlsx'))
+
+data %>% filter(TumorVol != 0) %>%
+  arrange(TumorVol)
+```
+
+```{r}
+Survival <- readxl::read_xlsx(here("data/survival.xlsx"))
+Survival <- Survival %>%
+  mutate(Mouse = paste0("E", Experiment, "_", "M", Mouse),
+         Experiment = factor(Experiment, levels = c(30,32,43), 
+                             labels = c('Donor A', 'Donor B', 'Donor C')),
+         Condition = factor(Condition), 
+         Group = factor(
+           case_when(Condition %in% c("Ctrl", "NTC", 'None', 'WT') ~ "No_CAR",
+                     Condition %in% c("CAR_NoCrispr", "CAR_MockCrispr") ~ "CAR", 
+                     Condition == "CAR_MGAT5Crispr" ~ "CAR_MGAT5"),
+           levels = c("No_CAR", "CAR", "CAR_MGAT5"), 
+           labels = c('Untreated', 'CD70 nanoCAR', 'CD70 nanoCAR - MGAT5 KO')),
+         StatusPrimary = factor(StatusPrimary, 
+                                levels = c("No control", 
+                                           "Partial control, relapse", 
+                                           "Control, relapse", 
+                                           "Control, no relapse")),
+         StatusSecondary = factor(StatusSecondary,
+                                  levels = c("No control", 
+                                             "Partial control", 
+                                             "Control", 
+                                             'No tumor')),
+         EventP_ControlNorelapse = ifelse(
+           StatusPrimary == "Control, no relapse", 1, 0),
+         EventP_ControlRelapse = ifelse(
+           StatusPrimary %in% c("Control, no relapse",
+                                   "Control, relapse"), 1, 0),
+         EventP_PartialcontrolRelapse = ifelse(
+           StatusPrimary %in% c("Control, no relapse",
+                                   "Control, relapse",
+                                   "Partial control, relapse"), 1, 0),
+         EventP_Relapse = ifelse(
+           StatusPrimary %in% c("Partial control, relapse",
+                                "Control, relapse"), 1, 0),
+         EventS_Control = ifelse(
+           StatusSecondary %in% c("Control"), 1, 0),
+         EventS_Partialcontrol = ifelse(
+           StatusSecondary %in% c("Control", "Partial control"), 1, 0),
+         TimeFUP_FullCtrl = TimeFUP_FullCtrl - day_CARtrt,
+         TimeFUP_PartialCtrl = TimeFUP_PartialCtrl - day_CARtrt,
+         TimeFUP_ctrltorelapse = case_when(
+           EventP_Relapse == 1 ~ DayRelapse - TimeFUP_PartialCtrl,
+           EventP_Relapse == 0 & StatusPrimary == 'Control, no relapse' ~
+             Daylastmeasurement - TimeFUP_PartialCtrl),
+         TimeFUS_FullCtrl = ifelse(
+           Experiment == 'Donor A', 
+           TimeFUS_FullCtrl - day_rechallenge_exp30,
+           TimeFUS_FullCtrl - day_rechallenge_exp32),
+         TimeFUS_PartialCtrl = ifelse(
+           Experiment == 'Donor B', 
+           TimeFUS_PartialCtrl - day_rechallenge_exp30,
+           TimeFUS_PartialCtrl - day_rechallenge_exp32),
+         )
+
+#Survival %>% writexl::write_xlsx(here('output/survivaldata.xlsx'))
+```
+
+# Longitudinal analysis Donor A
+
+## Primary tumor
+
+We will first put together a model for the mean structure. Since the first period, up to and including day 7 should be the same for each group, we will only start the modeling from day 7 on (so all data later than day 7). Why? We see a big variation at day 3, so we will leave this day out. We will put together a piece-wise linear model, which allows for changes in direction (i.e. tumors stop growing, stabilize etc), provided the inflection points are well chosen. Of course it is also important that the baseline tumor volumes do not differ, i.e. at day 7, since treatment starts at day 10 and the last measurement before this is day 7. In other words, we set day 7 as the baseline. This means that we will subtract 7 off of all the days. The intercept of the model will describe the situation at baseline (i.e. day 7) and we will test for differences at baseline (during model building).
+
+### Modeling
+
+```{r}
+modeldata_A1 <- data %>%
+  filter(Experiment == 'Donor A') %>%
+  filter(Day >= 7 & Day <= 84) %>%
+  filter(Tumor == "Primary Tumor" & !is.na(TumorVol))
+```
+
+We use a natural spline model with 5 df and a random Mouse intercept. 
+We use a Tweedie error structure (can model exact zeros) and a log link. 
+
+```{r}
+mod_A1 <- glmmTMB(data = modeldata_A1, 
+               TumorVol ~ ns(Day, df = 5)*Group + (1 | Mouse),
+               family = tweedie(link = 'log'),
+               REML = TRUE)
+
+modeldata_A1$predPopulation <- predict(mod_A1, re.form = NA, type = 'response')
+modeldata_A1$predIndividual <- predict(mod_A1, type = 'response')
+
+
+modeldata_A1 %>%
+  group_by(Group, Day) %>%
+  summarize(mTumorVol = mean(TumorVol, na.rm = T),
+            seTumVol = sd(TumorVol, na.rm = T)/sqrt(sum(!is.na(TumorVol)))
+  ) %>%
+  ggplot(aes(x = Day, y = mTumorVol, group = Group, color = Group)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mTumorVol-seTumVol, 
+                    ymax = mTumorVol+seTumVol)) +
+  geom_line(data = modeldata_A1, aes(y = predPopulation, colour = Group, group = Group)) +
+  scale_y_continuous(trans = power_trans(power = 1/3), 
+                     breaks = c(0, 10, 60, 200, 500, 1000, 2000, 3500, 5500)) +
+  theme_bw()
+
+# Individual fits
+modeldata_A1 %>%
+  ggplot(aes(x=Day, y = predIndividual, color = Group)) +
+  geom_line() +
+  geom_point(aes(y=TumorVol))+
+  facet_wrap(~Mouse) +
+  theme_bw()
+```
+
+Residual checks with DHARMa
+
+```{r}
+Resid_A1 <- simulateResiduals(fittedModel = mod_A1, plot = F)
+plot(Resid_A1)
+```
+
+### Inference
+
+First a summary of the model output. The table below gives exponentiated parameters and confidence intervals, which means they can be interpreted on the original tumor measurment scale.   
+
+```{r}
+knitr::kable(
+  left_join(
+    multcomp::glht(mod_A1) %>% summary %>% tidy,
+    multcomp::glht(mod_A1) %>% confint %>% tidy
+  ) %>%
+    mutate(adj.p.value = ifelse(
+      adj.p.value < 0.001, "<0.001", round(adj.p.value,3))) %>%
+    mutate(across(where(is.numeric)) %>% round(., 3)) %>%
+    select(Parameter = contrast,
+           Estimate = estimate,
+           `S.E.` = std.error,
+           Statistic = statistic,
+           `Adj. p-value` = adj.p.value,
+           )) %>% 
+  kableExtra::kable_styling()
+
+tidy(mod_A1) %>% write_xlsx(here('output/DonorA_primary_model.xlsx'))
+```
+
+We test for difference in tumor volume at the endpoint: 
+Getting the correct contrast matrix is not trivial, due to the natural spline function. We can use the emmeans package to do this a bit more easily.
+
+```{r}
+L_A1 <- rbind(
+  contrast(emmeans(mod_A1, ~Group | Day, at = list(Day = 0)), 
+           method = 'pairwise')@linfct[3,] %>% as.matrix %>% t, 
+  contrast(emmeans(mod_A1, ~Group | Day, at = list(Day = 30)), 
+           method = 'pairwise')@linfct[3,] %>% as.matrix %>% t)
+rownames(L_A1) <- c("Ratio of WT over MGAT5 KO tumor sizes at 0d",
+                    "Ratio of WT over MGAT5 KO tumor sizes at 30d")
+colnames(L_A1) <- names(fixef(mod_A1)$cond)
+
+table_A1 <- left_join(
+    multcomp::glht(mod_A1, linfct = L_A1) %>% summary %>% tidy,
+    multcomp::glht(mod_A1, linfct = L_A1) %>% confint %>% tidy
+  ) %>%
+    mutate(
+      `Adj. p-value` = ifelse(adj.p.value < 0.001, "<0.001", round(adj.p.value,3)),
+      Estimate = exp(estimate),
+      `95% CI, lower` = exp(conf.low),
+      `95% CI, upper` = exp(conf.high)
+      ) %>%
+    mutate(across(where(is.numeric)) %>% round(., 3)) %>%
+    select(Contrast = contrast,
+           Estimate,
+           `95% CI, lower`,
+           `95% CI, upper`,
+           `Adj. p-value`)
+
+table_A1
+
+table_A1 %>% write_xlsx(here('output/DonorA_primary_contrasts.xlsx'))
+```
+
+## Secondary Tumor
+
+We now turn to the secondary tumor, where we will model in in a similar way as for the primary tumor. Also note that we don't have tumor measurements for the first few days after rechallenge and the first day after rechallenge with measured tumor volumes is day 89.
+
+### Modeling
+
+```{r}
+modeldata_A2 <- data %>%
+  filter(Tumor == "Secondary Tumor" & 
+           !is.na(logTumorVol) &
+           Experiment == 'Donor A')
+```
+
+We use a natural spline model with 5 df and a random Mouse intercept. 
+We use a Tweedie error structure (can model exact zeros) and a log link. 
+
+```{r}
+mod_A2 <- glmmTMB(data = modeldata_A2,
+                  TumorVol ~ ns(Day, df = 5)*Group + (1|Mouse),
+                  family = tweedie(link = 'log'),
+                  REML = TRUE)
+
+modeldata_A2$predPopulation <- predict(mod_A2, re.form = NA, type = 'response')
+modeldata_A2$predIndividual <- predict(mod_A2, type = 'response')
+
+modeldata_A2 %>%
+  group_by(Group, Day) %>%
+  summarize(mTumorVol = mean(TumorVol, na.rm = T),
+            seTumVol = sd(TumorVol, na.rm = T)/sqrt(sum(!is.na(TumorVol)))
+  ) %>%
+  ggplot(aes(x = Day, y = mTumorVol, group = Group, color = Group)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mTumorVol-seTumVol, 
+                    ymax = mTumorVol+seTumVol)) +
+  geom_line(data = modeldata_A2, aes(y = predPopulation, colour = Group, group = Group)) +
+  scale_y_continuous(trans = power_trans(power = 1/3), 
+                     breaks = c(0, 10, 60, 200, 500, 1000, 2000, 3500, 5500)) +
+  theme_bw()
+
+# Individual fits
+modeldata_A2 %>%
+  ggplot(aes(x=Day, y = predIndividual, color = Group)) +
+  geom_line() +
+  geom_point(aes(y=TumorVol))+
+  facet_wrap(~Mouse) +
+  theme_bw()
+```
+
+Residual checks with DHARMa
+
+```{r}
+plot(simulateResiduals(fittedModel = mod_A2, plot = F))
+```
+
+### Inference
+
+First a summary of the model output. The table below gives exponentiated parameters and confidence intervals, which means they can be interpreted on the original tumor measurment scale.   
+
+```{r}
+knitr::kable(
+  left_join(
+    multcomp::glht(mod_A2) %>% summary %>% tidy,
+    multcomp::glht(mod_A2) %>% confint %>% tidy
+  ) %>%
+    mutate(adj.p.value = ifelse(
+      adj.p.value < 0.001, "<0.001", round(adj.p.value,3))) %>%
+    mutate(across(where(is.numeric)) %>% round(., 3)) %>%
+    select(Parameter = contrast,
+           Estimate = estimate,
+           `S.E.` = std.error,
+           Statistic = statistic,
+           `Adj. p-value` = adj.p.value,
+           )) %>% 
+  kableExtra::kable_styling()
+
+tidy(mod_A2) %>% write_xlsx(here('output/DonorA_secondary_model.xlsx'))
+```
+
+We test for difference in tumor volume at the endpoint: 
+Getting the correct contrast matrix is not trivial, due to the natural spline function. We can use the emmeans package to do this a bit more easily.
+
+```{r}
+L_A2 <- rbind(
+  contrast(emmeans(mod_A2, ~Group | Day, at = list(Day = 89)), method = 'pairwise')@linfct[3,] %>% as.matrix %>% t, 
+  contrast(emmeans(mod_A2, ~Group | Day, at = list(Day = 115)), method = 'pairwise')@linfct[3,] %>% as.matrix %>% t)
+
+rownames(L_A2) <- c('Ratio of WT vs MGAT5 KO tumor sizes at 89d', 
+                    'Ratio of WT vs MGAT5 KO tumor sizes at 115d')
+colnames(L_A2) <- names(fixef(mod_A2)$cond)
+
+table_A2 <-  left_join(
+    multcomp::glht(mod_A2, linfct = L_A2) %>% summary %>% tidy,
+    multcomp::glht(mod_A2, linfct = L_A2) %>% confint %>% tidy
+  ) %>%
+    mutate(
+      `Adj. p-value` = ifelse(adj.p.value < 0.001, "<0.001", round(adj.p.value,3)),
+      Estimate = exp(estimate),
+      `95% CI, lower` = exp(conf.low),
+      `95% CI, upper` = exp(conf.high)
+      ) %>%
+    mutate(across(where(is.numeric)) %>% round(., 3)) %>%
+    select(Contrast = contrast,
+           Estimate,
+           `95% CI, lower`,
+           `95% CI, upper`,
+           `Adj. p-value`)
+
+table_A2
+
+table_A2 %>% write_xlsx(here('output/DonorA_secondary_contrasts.xlsx'))
+```
+
+# Longitudinal analysis Donor B
+
+## Primary tumor
+### Modeling
+
+```{r}
+modeldata_B1 <- data %>%
+  filter(Experiment == 'Donor B') %>%
+  filter(Day <= 90) %>%
+  filter(Tumor == "Primary Tumor") %>%
+  mutate(TumorVol = ifelse(Group == 'CD70 nanoCAR' & Day == 87, NA, TumorVol)) %>%
+  filter(!is.na(TumorVol))
+```
+
+We use a natural spline model with 5 df and a random Mouse intercept. 
+We use a Tweedie error structure (can model exact zeros) and a log link. 
+
+```{r}
+mod_B1 <- glmmTMB(data = modeldata_B1, 
+               TumorVol ~ ns(Day, df = 5)*Group + (Day | Mouse),
+               family = tweedie(link = 'log'),
+               REML = TRUE)
+
+modeldata_B1$predPopulation <- predict(mod_B1, re.form = NA, type = 'response')
+modeldata_B1$predIndividual <- predict(mod_B1, type = 'response')
+
+
+modeldata_B1 %>%
+  group_by(Group, Day) %>%
+  summarize(mTumorVol = mean(TumorVol, na.rm = T),
+            seTumVol = sd(TumorVol, na.rm = T)/sqrt(sum(!is.na(TumorVol)))
+  ) %>%
+  ggplot(aes(x = Day, y = mTumorVol, group = Group, color = Group)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mTumorVol-seTumVol, 
+                    ymax = mTumorVol+seTumVol)) +
+  geom_line(data = modeldata_B1, aes(y = predPopulation, colour = Group, group = Group)) +
+  scale_y_continuous(trans = power_trans(power = 1/3), 
+                     breaks = c(0, 10, 60, 200, 500, 1000, 2000, 3500, 5500)) +
+  theme_bw()
+
+# Individual fits
+modeldata_B1 %>%
+  ggplot(aes(x=Day, y = predIndividual, color = Group)) +
+  geom_line() +
+  geom_point(aes(y=TumorVol))+
+  facet_wrap(~Mouse) +
+  theme_bw()
+```
+
+Residual checks with DHARMa
+
+```{r}
+Resid_B1 <- simulateResiduals(fittedModel = mod_B1, plot = F)
+plot(Resid_B1)
+```
+
+### Inference
+
+First a summary of the model output. The table below gives exponentiated parameters and confidence intervals, which means they can be interpreted on the original tumor measurment scale.   
+
+```{r}
+knitr::kable(
+  left_join(
+    multcomp::glht(mod_B1) %>% summary %>% tidy,
+    multcomp::glht(mod_B1) %>% confint %>% tidy
+  ) %>%
+    mutate(adj.p.value = ifelse(
+      adj.p.value < 0.001, "<0.001", round(adj.p.value,3))) %>%
+    mutate(across(where(is.numeric)) %>% round(., 3)) %>%
+    select(Parameter = contrast,
+           Estimate = estimate,
+           `S.E.` = std.error,
+           Statistic = statistic,
+           `Adj. p-value` = adj.p.value,
+           )) %>% 
+  kableExtra::kable_styling()
+
+tidy(mod_B1) %>% write_xlsx(here('output/DonorB_primary_model.xlsx'))
+```
+
+We test for difference in tumor volume at the endpoint: 
+Getting the correct contrast matrix is not trivial, due to the natural spline function. We can use the emmeans package to do this a bit more easily.
+
+```{r}
+L_B1 <- rbind(
+  contrast(emmeans(mod_B1, ~Group | Day, at = list(Day = 0)), 
+           method = 'pairwise')@linfct[3,] %>% as.matrix %>% t, 
+  contrast(emmeans(mod_B1, ~Group | Day, at = list(Day = 86)), 
+           method = 'pairwise')@linfct[3,] %>% as.matrix %>% t)
+rownames(L_B1) <- c("Ratio of WT over MGAT5 KO tumor sizes at 0d",
+                    "Ratio of WT over MGAT5 KO tumor sizes at 86d")
+colnames(L_B1) <- names(fixef(mod_B1)$cond)
+
+table_B1 <- left_join(
+    multcomp::glht(mod_B1, linfct = L_B1) %>% summary %>% tidy,
+    multcomp::glht(mod_B1, linfct = L_B1) %>% confint %>% tidy
+  ) %>%
+    mutate(
+      `Adj. p-value` = ifelse(adj.p.value < 0.001, "<0.001", round(adj.p.value,3)),
+      Estimate = exp(estimate),
+      `95% CI, lower` = exp(conf.low),
+      `95% CI, upper` = exp(conf.high)
+      ) %>%
+    mutate(across(where(is.numeric)) %>% round(., 3)) %>%
+    select(Contrast = contrast,
+           Estimate,
+           `95% CI, lower`,
+           `95% CI, upper`,
+           `Adj. p-value`)
+
+table_B1
+
+table_B1 %>% write_xlsx(here('output/DonorB_primary_contrasts.xlsx'))
+```
+
+## Secondary Tumor
+
+We now turn to the secondary tumor, where we will model in in a similar way as for the primary tumor. Also note that we don't have tumor measurements for the first few days after rechallenge and the first day after rechallenge with measured tumor volumes is day 89.
+
+### Modeling
+
+```{r}
+modeldata_B2 <- data %>%
+  filter(Tumor == "Secondary Tumor" & 
+           !is.na(logTumorVol) &
+           Experiment == 'Donor B')
+```
+
+We use a natural spline model with 5 df and a random Mouse intercept. 
+We use a Tweedie error structure (can model exact zeros) and a log link. 
+
+```{r}
+mod_B2 <- glmmTMB(data = modeldata_B2,
+                  TumorVol ~ ns(Day, df = 5)*Group + (1|Mouse),
+                  family = tweedie(link = 'log'),
+                  REML = TRUE)
+
+modeldata_B2$predPopulation <- predict(mod_B2, re.form = NA, type = 'response')
+modeldata_B2$predIndividual <- predict(mod_B2, type = 'response')
+
+modeldata_B2 %>%
+  group_by(Group, Day) %>%
+  summarize(mTumorVol = mean(TumorVol, na.rm = T),
+            seTumVol = sd(TumorVol, na.rm = T)/sqrt(sum(!is.na(TumorVol)))
+  ) %>%
+  ggplot(aes(x = Day, y = mTumorVol, group = Group, color = Group)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mTumorVol-seTumVol, 
+                    ymax = mTumorVol+seTumVol)) +
+  geom_line(data = modeldata_B2, aes(y = predPopulation, colour = Group, group = Group)) +
+  scale_y_continuous(trans = power_trans(power = 1/3), 
+                     breaks = c(0, 10, 60, 200, 500, 1000, 2000, 3500, 5500)) +
+  theme_bw()
+
+# Individual fits
+modeldata_B2 %>%
+  ggplot(aes(x=Day, y = predIndividual, color = Group)) +
+  geom_line() +
+  geom_point(aes(y=TumorVol))+
+  facet_wrap(~Mouse) +
+  scale_y_continuous(trans = power_trans(power = 1/3), 
+                     breaks = c(0, 10, 60, 200, 500, 1000, 2000, 3500, 5500)) +
+  theme_bw()
+```
+
+Residual checks with DHARMa
+
+```{r}
+plot(simulateResiduals(fittedModel = mod_B2, plot = F))
+```
+
+### Inference
+
+First a summary of the model output. The table below gives exponentiated parameters and confidence intervals, which means they can be interpreted on the original tumor measurment scale.   
+
+```{r}
+knitr::kable(
+  left_join(
+    multcomp::glht(mod_B2) %>% summary %>% tidy,
+    multcomp::glht(mod_B2) %>% confint %>% tidy
+  ) %>%
+    mutate(adj.p.value = ifelse(
+      adj.p.value < 0.001, "<0.001", round(adj.p.value,3))) %>%
+    mutate(across(where(is.numeric)) %>% round(., 3)) %>%
+    select(Parameter = contrast,
+           Estimate = estimate,
+           `S.E.` = std.error,
+           Statistic = statistic,
+           `Adj. p-value` = adj.p.value,
+           )) %>% 
+  kableExtra::kable_styling()
+
+tidy(mod_B2) %>% write_xlsx(here('output/DonorB_secondary_model.xlsx'))
+```
+
+We test for difference in tumor volume at the endpoint: 
+Getting the correct contrast matrix is not trivial, due to the natural spline function. We can use the emmeans package to do this a bit more easily.
+
+```{r}
+L_B2 <- rbind(
+  contrast(emmeans(mod_B2, ~Group | Day, at = list(Day = 92)), method = 'pairwise')@linfct[3,] %>% as.matrix %>% t, 
+  contrast(emmeans(mod_B2, ~Group | Day, at = list(Day = 119)), method = 'pairwise')@linfct[3,] %>% as.matrix %>% t)
+
+rownames(L_B2) <- c('Ratio of WT vs MGAT5 KO tumor sizes at d92', 
+                    'Ratio of WT vs MGAT5 KO tumor sizes at d119')
+colnames(L_B2) <- names(fixef(mod_B2)$cond)
+
+table_B2 <-  left_join(
+    multcomp::glht(mod_B2, linfct = L_B2) %>% summary %>% tidy,
+    multcomp::glht(mod_B2, linfct = L_B2) %>% confint %>% tidy
+  ) %>%
+    mutate(
+      `Adj. p-value` = ifelse(adj.p.value < 0.001, "<0.001", round(adj.p.value,3)),
+      Estimate = exp(estimate),
+      `95% CI, lower` = exp(conf.low),
+      `95% CI, upper` = exp(conf.high)
+      ) %>%
+    mutate(across(where(is.numeric)) %>% round(., 3)) %>%
+    select(Contrast = contrast,
+           Estimate,
+           `95% CI, lower`,
+           `95% CI, upper`,
+           `Adj. p-value`)
+
+table_B2
+
+table_B2 %>% write_xlsx(here('output/DonorB_secondary_contrasts.xlsx'))
+```
+
+# Longitudinal analysis Donor C
+
+## Primary tumor
+### Modeling
+
+```{r}
+modeldata_C1 <- data %>%
+  filter(Experiment == 'Donor C') %>%
+  filter(Day <= 77 & Day >= 7) %>%
+  filter(Tumor == "Primary Tumor") %>%
+  filter(!is.na(TumorVol))
+```
+
+We use a natural spline model with 5 df and a random Mouse intercept. 
+We use a Tweedie error structure (can model exact zeros) and a log link. 
+
+```{r}
+mod_C1 <- glmmTMB(data = modeldata_C1, 
+               TumorVol ~ ns(Day, df = 5)*Group + (1 | Mouse),
+               family = tweedie(link = 'log'),
+               REML = TRUE)
+
+modeldata_C1$predPopulation <- predict(mod_C1, re.form = NA, type = 'response')
+modeldata_C1$predIndividual <- predict(mod_C1, type = 'response')
+
+
+modeldata_C1 %>%
+  group_by(Group, Day) %>%
+  summarize(mTumorVol = mean(TumorVol, na.rm = T),
+            seTumVol = sd(TumorVol, na.rm = T)/sqrt(sum(!is.na(TumorVol)))
+  ) %>%
+  ggplot(aes(x = Day, y = mTumorVol, group = Group, color = Group)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mTumorVol-seTumVol, 
+                    ymax = mTumorVol+seTumVol)) +
+  geom_line(data = modeldata_C1, aes(y = predPopulation, colour = Group, group = Group)) +
+  scale_y_continuous(trans = power_trans(power = 1/3), 
+                     breaks = c(0, 10, 60, 200, 500, 1000, 2000, 3500, 5500)) +
+  theme_bw()
+
+# Individual fits
+modeldata_C1 %>%
+  ggplot(aes(x=Day, y = predIndividual, color = Group)) +
+  geom_line() +
+  geom_point(aes(y=TumorVol))+
+  facet_wrap(~Mouse) +
+  theme_bw()
+```
+
+Residual checks with DHARMa
+
+```{r}
+Resid_C1 <- simulateResiduals(fittedModel = mod_C1, plot = F)
+plot(Resid_C1)
+```
+
+### Inference
+
+First a summary of the model output. The table below gives exponentiated parameters and confidence intervals, which means they can be interpreted on the original tumor measurment scale.   
+
+```{r}
+knitr::kable(
+  left_join(
+    multcomp::glht(mod_C1) %>% summary %>% tidy,
+    multcomp::glht(mod_C1) %>% confint %>% tidy
+  ) %>%
+    mutate(adj.p.value = ifelse(
+      adj.p.value < 0.001, "<0.001", round(adj.p.value,3))) %>%
+    mutate(across(where(is.numeric)) %>% round(., 3)) %>%
+    select(Parameter = contrast,
+           Estimate = estimate,
+           `S.E.` = std.error,
+           Statistic = statistic,
+           `Adj. p-value` = adj.p.value,
+           )) %>% 
+  kableExtra::kable_styling()
+
+tidy(mod_C1) %>% write_xlsx(here('output/DonorC_primary_model.xlsx'))
+```
+
+We test for difference in tumor volume at the endpoint: 
+Getting the correct contrast matrix is not trivial, due to the natural spline function. We can use the emmeans package to do this a bit more easily.
+
+```{r}
+L_C1 <- rbind(
+  contrast(emmeans(mod_C1, ~Group | Day, at = list(Day = 7)), 
+           method = 'pairwise')@linfct[3,] %>% as.matrix %>% t, 
+  contrast(emmeans(mod_C1, ~Group | Day, at = list(Day = 77)), 
+           method = 'pairwise')@linfct[3,] %>% as.matrix %>% t)
+rownames(L_C1) <- c("Ratio of WT over MGAT5 KO tumor sizes at 7d",
+                    "Ratio of WT over MGAT5 KO tumor sizes at 77d")
+colnames(L_C1) <- names(fixef(mod_C1)$cond)
+
+table_C1 <- left_join(
+    multcomp::glht(mod_C1, linfct = L_C1) %>% summary %>% tidy,
+    multcomp::glht(mod_C1, linfct = L_C1) %>% confint %>% tidy
+  ) %>%
+    mutate(
+      `Adj. p-value` = ifelse(adj.p.value < 0.001, "<0.001", round(adj.p.value,3)),
+      Estimate = exp(estimate),
+      `95% CI, lower` = exp(conf.low),
+      `95% CI, upper` = exp(conf.high)
+      ) %>%
+    mutate(across(where(is.numeric)) %>% round(., 3)) %>%
+    select(Contrast = contrast,
+           Estimate,
+           `95% CI, lower`,
+           `95% CI, upper`,
+           `Adj. p-value`)
+
+table_C1
+
+table_C1 %>% write_xlsx(here('output/DonorC_primary_contrasts.xlsx'))
+```
+
+## Secondary Tumor
+
+We now turn to the secondary tumor, where we will model in in a similar way as for the primary tumor. Also note that we don't have tumor measurements for the first few days after rechallenge and the first day after rechallenge with measured tumor volumes is day 89.
+
+### Modeling
+
+```{r}
+modeldata_C2 <- data %>%
+  filter(Tumor == "Secondary Tumor" & 
+           !is.na(logTumorVol) &
+           Experiment == 'Donor C') %>%
+  filter(Day >= 96)
+```
+
+We use a natural spline model with 5 df and a random Mouse intercept. 
+We use a Tweedie error structure (can model exact zeros) and a log link. 
+
+```{r}
+mod_C2 <- glmmTMB(data = modeldata_C2,
+                  TumorVol ~ ns(Day, df = 3)*Group + (1|Mouse),
+                  family = tweedie(link = 'log'),
+                  REML = TRUE)
+
+modeldata_C2$predPopulation <- predict(mod_C2, re.form = NA, type = 'response')
+modeldata_C2$predIndividual <- predict(mod_C2, type = 'response')
+
+modeldata_C2 %>%
+  group_by(Group, Day) %>%
+  summarize(mTumorVol = mean(TumorVol, na.rm = T),
+            seTumVol = sd(TumorVol, na.rm = T)/sqrt(sum(!is.na(TumorVol)))
+  ) %>%
+  ggplot(aes(x = Day, y = mTumorVol, group = Group, color = Group)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mTumorVol-seTumVol, 
+                    ymax = mTumorVol+seTumVol)) +
+  geom_line(data = modeldata_C2, aes(y = predPopulation, colour = Group, group = Group)) +
+  scale_y_continuous(trans = power_trans(power = 1/3), 
+                     breaks = c(0, 10, 60, 200, 500, 1000, 2000, 3500, 5500)) +
+  theme_bw()
+
+# Individual fits
+modeldata_C2 %>%
+  ggplot(aes(x=Day, y = predIndividual, color = Group)) +
+  geom_line() +
+  geom_point(aes(y=TumorVol))+
+  facet_wrap(~Mouse) +
+  scale_y_continuous(trans = power_trans(power = 1/3), 
+                     breaks = c(0, 10, 60, 200, 500, 1000, 2000, 3500, 5500)) +
+  theme_bw()
+```
+
+Residual checks with DHARMa
+
+```{r}
+plot(simulateResiduals(fittedModel = mod_C2, plot = F))
+```
+
+### Inference
+
+First a summary of the model output. The table below gives exponentiated parameters and confidence intervals, which means they can be interpreted on the original tumor measurment scale.   
+
+```{r}
+knitr::kable(
+  left_join(
+    multcomp::glht(mod_C2) %>% summary %>% tidy,
+    multcomp::glht(mod_C2) %>% confint %>% tidy
+  ) %>%
+    mutate(adj.p.value = ifelse(
+      adj.p.value < 0.001, "<0.001", round(adj.p.value,3))) %>%
+    mutate(across(where(is.numeric)) %>% round(., 3)) %>%
+    select(Parameter = contrast,
+           Estimate = estimate,
+           `S.E.` = std.error,
+           Statistic = statistic,
+           `Adj. p-value` = adj.p.value,
+           )) %>% 
+  kableExtra::kable_styling()
+
+tidy(mod_C2) %>% write_xlsx(here('output/DonorC_secondary_model.xlsx'))
+```
+
+We test for difference in tumor volume at the endpoint: 
+Getting the correct contrast matrix is not trivial, due to the natural spline function. We can use the emmeans package to do this a bit more easily.
+
+```{r}
+L_C2 <- rbind(
+  contrast(emmeans(mod_C2, ~Group | Day, at = list(Day = 98)), method = 'pairwise')@linfct[3,] %>% as.matrix %>% t, 
+  contrast(emmeans(mod_C2, ~Group | Day, at = list(Day = 119)), method = 'pairwise')@linfct[3,] %>% as.matrix %>% t)
+
+rownames(L_C2) <- c('Ratio of WT vs MGAT5 KO tumor sizes at d98', 
+                    'Ratio of WT vs MGAT5 KO tumor sizes at d119')
+colnames(L_C2) <- names(fixef(mod_C2)$cond)
+
+table_C2 <-  left_join(
+    multcomp::glht(mod_C2, linfct = L_C2) %>% summary %>% tidy,
+    multcomp::glht(mod_C2, linfct = L_C2) %>% confint %>% tidy
+  ) %>%
+    mutate(
+      `Adj. p-value` = ifelse(adj.p.value < 0.001, "<0.001", round(adj.p.value,3)),
+      Estimate = exp(estimate),
+      `95% CI, lower` = exp(conf.low),
+      `95% CI, upper` = exp(conf.high)
+      ) %>%
+    mutate(across(where(is.numeric)) %>% round(., 3)) %>%
+    select(Contrast = contrast,
+           Estimate,
+           `95% CI, lower`,
+           `95% CI, upper`,
+           `Adj. p-value`)
+
+table_C2
+
+table_C2 %>% write_xlsx(here('output/DonorC_secondary_contrasts.xlsx'))
+```
+
+# Figure combined longitudinal 
+
+```{r}
+data_fig <- data %>%
+  group_by(Experiment, Group, Day, Tumor, Period) %>%
+  summarize(n = n(),
+            mTumorVol = mean(TumorVol, na.rm = T),
+            seTumVol = sd(TumorVol, na.rm = T)/sqrt(sum(!is.na(TumorVol))),
+            mlTumorVol = mean(logTumorVol, na.rm = T),
+            selTumVol = sd(logTumorVol, na.rm = T)/sqrt(sum(!is.na(logTumorVol)))
+  )
+```
+
+Original figure
+```{r}
+original <- data_fig %>%
+  ggplot(aes(x = Day, y = mlTumorVol, group = Group, color = Group)) +
+  geom_point(aes(shape = Group, fill = Group)) +
+  geom_line() +
+  geom_errorbar(aes(ymin = mlTumorVol-selTumVol, ymax = mlTumorVol+selTumVol)) +
+  facet_grid(Experiment ~ Period, scales = 'free_x') +
+  scale_colour_manual(values = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  scale_shape_manual(values = c(
+    'circle filled', 'triangle filled', 'triangle down filled')) +
+  scale_fill_manual(values = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  ggnewscale::new_scale_colour() +
+  geom_errorbar(aes(ymin = mlTumorVol-selTumVol, 
+                    ymax = mlTumorVol+selTumVol, 
+                    color = Group)) +
+  scale_color_manual(values = c(
+    rgb(164,138,211, maxColorValue = 255), 
+    rgb(111,199,207, maxColorValue = 255),
+    rgb(251,162,125, maxColorValue = 255))) +
+  ylab(expression(paste('Tumor Volume (mm'^'3',')'))) +
+  scale_y_continuous(breaks = c(-4,-2,0,2,4,6,8,10),
+                     labels = c('0','0.25','1','4','16','64','256','1024'))+
+  theme_bw()
+
+ggsave(here("output/original.pdf"), original,
+       device = "pdf", height = 6, width = 10, dpi=300)
+
+original
+```
+
+Now with cube root y-axis transformation
+
+```{r}
+cbrt <- data_fig %>%
+  ggplot(aes(x = Day, y = mTumorVol, group = Group, color = Group)) +
+  geom_point(aes(shape = Group, fill = Group)) +
+  geom_line() +
+  facet_grid(Experiment ~ Period, scales = 'free_x') +
+  scale_colour_manual(values = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  scale_shape_manual(values = c(
+    'circle filled', 'triangle filled', 'triangle down filled')) +
+  scale_fill_manual(values = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  ggnewscale::new_scale_colour() +
+  geom_errorbar(aes(ymin = mTumorVol-seTumVol, 
+                    ymax = mTumorVol+seTumVol, 
+                    color = Group)) +
+  scale_color_manual(values = c(
+    rgb(164,138,211, maxColorValue = 255), 
+    rgb(111,199,207, maxColorValue = 255),
+    rgb(251,162,125, maxColorValue = 255))) +
+  ylab(expression(paste('Tumor Volume (mm'^'3',')'))) +
+  scale_y_continuous(trans = power_trans(power = 1/3), 
+                     breaks = c(0, 10, 60, 200, 500, 1000, 2000, 3500, 5500)) +
+  theme_bw() +
+  theme(panel.grid.minor.y = element_blank())
+
+ggsave(here("output/fig3_cbrt.pdf"), cbrt,
+       device = "pdf", height = 8, width = 12, dpi=300)
+
+cbrt
+```
+
+```{r}
+cbrt_annotated <- data_fig %>%
+  ggplot(aes(x = Day, y = mTumorVol, group = Group, color = Group)) +
+  geom_point(aes(shape = Group, fill = Group)) +
+  geom_line() +
+  geom_text(aes(label = n, 
+                y = ifelse(Group == 'Untreated', 6500, 
+                           ifelse(Group == 'CD70 nanoCAR', 5500, 4600))), 
+            size = 1.5) +
+  facet_grid(Experiment ~ Period, scales = 'free_x') +
+  scale_colour_manual(values = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  scale_shape_manual(values = c(
+    'circle filled', 'triangle filled', 'triangle down filled')) +
+  scale_fill_manual(values = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  ggnewscale::new_scale_colour() +
+  geom_errorbar(aes(ymin = mTumorVol-seTumVol, 
+                    ymax = mTumorVol+seTumVol, 
+                    color = Group)) +
+  scale_color_manual(values = c(
+    rgb(164,138,211, maxColorValue = 255), 
+    rgb(111,199,207, maxColorValue = 255),
+    rgb(251,162,125, maxColorValue = 255))) +
+  ylab(expression(paste('Tumor Volume (mm'^'3',')'))) +
+  scale_y_continuous(trans = power_trans(power = 1/3), 
+                     breaks = c(0, 10, 60, 200, 500, 1000, 2000, 3500, 5500)) +
+  theme_bw() +
+  theme(panel.grid.minor.y = element_blank())
+
+ggsave(here("output/fig3_cbrt_txt.pdf"), cbrt_annotated,
+       device = "pdf", height = 8, width = 12, dpi=300)
+
+cbrt_annotated
+```
+
+# Tables
+## Table for primary tumor, experiments combined
+
+```{r}
+GroupTotals <- Survival %>%
+  filter(!is.na(StatusPrimary)) %>%
+  group_by(Group) %>%
+  summarise(Total = n())
+
+tableall <- knitr::kable(Survival %>%
+    filter(!is.na(StatusPrimary)) %>%
+    count(StatusPrimary, Group) %>%
+    complete(StatusPrimary, Group) %>%
+    mutate(n = ifelse(is.na(n), 0, n)) %>%
+    left_join(., GroupTotals) %>%
+    mutate(`%` = signif(n/Total, 3)*100) %>%
+    select(Group, Status = StatusPrimary, Cases = n, Total, `%`) %>%
+    mutate(Case_Tot_pct = paste0(`%`, '%', ' (', Cases, '/', Total, ')')) %>%
+    select(-c(Cases, Total, `%`)) %>%
+    pivot_wider(names_from = Status, values_from = Case_Tot_pct) %>%
+    arrange(Group)
+    ) 
+
+tableall %>% kableExtra::save_kable(file = here("output/TablePrimary_All.pdf"))
+
+tableall %>% kableExtra::kable_styling()
+```
+
+
+## Table for primary tumor, separate experiments
+
+```{r}
+GroupTotals <- Survival %>%
+  filter(!is.na(StatusPrimary)) %>%
+  group_by(Experiment, Group) %>%
+  summarise(Total = n())
+
+tableprimary_byexperiment <- knitr::kable(
+  Survival %>%
+    filter(!is.na(StatusPrimary)) %>%
+    count(StatusPrimary, Experiment, Group) %>%
+    complete(StatusPrimary, Experiment, Group) %>%
+    mutate(n = ifelse(is.na(n), 0, n)) %>%
+    left_join(., GroupTotals) %>%
+    mutate(`%` = signif(n/Total, 3)*100) %>%
+    select(Experiment, Group, Status = StatusPrimary, Cases = n, Total, `%`) %>%
+    mutate(Case_Tot_pct = paste0(`%`, '%', ' (', Cases, '/', Total, ')')) %>%
+    select(-c(Cases, Total, `%`)) %>%
+    pivot_wider(names_from = Status, values_from = Case_Tot_pct) %>%
+    arrange(Experiment, Group))
+
+tableprimary_byexperiment %>% kableExtra::save_kable(file = here("output/TablePrimary_byExp.pdf"))
+
+tableprimary_byexperiment %>% kableExtra::kable_styling()
+```
+
+## Table for secondary tumor, experiments combined
+
+```{r}
+GroupTotals <- Survival %>%
+  filter(!is.na(StatusSecondary)) %>%
+  group_by(Group) %>%
+  summarise(Total = n())
+
+TableSecondary_All <- knitr::kable(Survival %>%
+    filter(!is.na(StatusSecondary)) %>%
+    count(StatusSecondary, Group) %>%
+    complete(StatusSecondary, Group) %>%
+    mutate(n = ifelse(is.na(n), 0, n)) %>%
+    left_join(., GroupTotals) %>%
+    mutate(`%` = signif(n/Total, 3)*100) %>%
+    select(Group, Status = StatusSecondary, Cases = n, Total, `%`) %>%
+    mutate(Case_Tot_pct = paste0(`%`, '%', ' (', Cases, '/', Total, ')')) %>%
+    select(-c(Cases, Total, `%`)) %>%
+    pivot_wider(names_from = Status, values_from = Case_Tot_pct) %>%
+    arrange(Group)
+    )
+
+TableSecondary_All %>% kableExtra::save_kable(file = here("output/TableSecondary_All.pdf"))
+
+TableSecondary_All %>% kableExtra::kable_styling()
+```
+
+
+## Table for secondary tumor, separate experiments
+
+```{r}
+GroupTotals <- Survival %>%
+  filter(!is.na(StatusSecondary)) %>%
+  group_by(Experiment, Group) %>%
+  summarise(Total = n())
+
+TableSecondary_byExp <- knitr::kable(Survival %>%
+    filter(!is.na(StatusSecondary)) %>%
+    count(StatusSecondary, Experiment, Group) %>%
+    complete(StatusSecondary, Experiment, Group) %>%
+    mutate(n = ifelse(is.na(n), 0, n)) %>%
+    left_join(., GroupTotals) %>%
+    mutate(`%` = signif(n/Total, 3)*100) %>%
+    select(Experiment, Group, Status = StatusSecondary, Cases = n, Total, `%`) %>%
+    mutate(Case_Tot_pct = paste0(`%`, '%', ' (', Cases, '/', Total, ')')) %>%
+    select(-c(Cases, Total, `%`)) %>%
+    pivot_wider(names_from = Status, values_from = Case_Tot_pct) %>%
+    arrange(Experiment, Group) 
+    )
+
+TableSecondary_byExp %>% kableExtra::save_kable(file = here("output/TableSecondary_byExp.pdf"))
+
+TableSecondary_byExp %>% kableExtra::kable_styling()
+```
+
+
+```{r}
+citation('glmmTMB')
+citation('splines')
+```
+

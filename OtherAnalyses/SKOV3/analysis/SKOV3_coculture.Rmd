@@ -1,0 +1,450 @@
+---
+title: "SKOV3 coculture"
+author: "Leander Meuris"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+---
+
+# Introduction
+
+## Experimental setting
+
+In vitro coculture experiment:
+THP-1 tumor cells mixed with CAR T cells.
+Setup: 
+- 3 donors for T cells = bioreplicates
+- 2 technical replicates for each setup
+- Several ratio's of CAR T cells versus THP-1 cells: 0.15 and 0.015 (relative count) most relevant, but also 0.0015 and no T cells.
+- 3 different treatments of T-cells: non-transduced controls, CD70 nanoCAR, CD70 nanoCAR - MGAT5 KO.
+
+This makes for 3 treatments x 4 CAR T dilutions x 2 replicates x 3 donors = 72 wells, which are prepared in a single 96-well plate. 
+
+Then, the aim is to count the T-cell development over 5 timepoints: 
+day 0 = baseline
+day 4 = expansion
+day 7 = expansion
+	after measurement, a second batch of THP-1 cells is added 
+day 11 = expansion
+day 14 = exhaustion
+
+A single plate (with 72 wells) is prepared and used up for each timepoint. 
+
+Cells are counted by flow cytometry. All CAR transduced cells are GFP positive. T-cells are counted via CD3 staining. 
+
+## Types of treatment
+
+The different types of treatment are called 'Condition' in the datasets. They are:
+
+  - NTC (non-transduced controls): WT T-cells (so no CART cells)
+  - WTCAR: CD70 nanoCAR T cells that were treated with irrelevant Crispr reagents. 
+  - MGAT5CAR: CD70 nanoCAR T cells that were treated with MGAT5 KO Crispr reagents. 
+  
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(echo = FALSE, 
+                      eval = TRUE, 
+                      warning = FALSE, 
+                      message = FALSE)
+```
+
+```{r libraries}
+here::i_am("analysis/SKOV3_coculture.Rmd")
+library(here)
+library(tidyverse)
+library(GLMMadaptive)
+library(DHARMa)
+#library(clubSandwich) # to calculate sandwich estimators
+```
+
+# Data
+
+## Description of the data
+
+Data are count data from flow cytometry that were normalized with counting beads (hence they are not whole numbers).
+There is a ETRatio column, the ratio of effector (CAR T) cells over tumor (THP-1) cells. 
+There is a Day column, the day of measurement of the (CAR) T cells
+All the other columns are count columns (normalized to counting beads), with an indication of the type of treatement:
+  - NTC (non-transduced controls): WT T-cells (so no CART cells)
+  - WTCAR: CD70 nanoCAR T cells that were treated with irrelevant Crispr reagents. 
+  - MGAT5CAR: CD70 nanoCAR T cells that were treated with MGAT5 KO Crispr reagents
+And also an indication of the donor: D1, D2, D3
+
+
+```{r data}
+Exp40 <- readxl::read_xlsx(here("data/Exp40_CleanedData.xlsx"))
+```
+
+## Data cleaning and creating new variables
+
+We turn the wide data into long format for modeling. 
+Create a new variable for donor and for Group.
+Create a new dataset where we create a new variable called ID, that indicates which measurements belong to the same donor/group/ETRatio (for longitudinal modeling).
+
+```{r combinedata}
+day_rechallenge <- 7
+
+data <- Exp40 %>%
+  pivot_longer(cols = starts_with('Count'), 
+               values_to = 'Count', 
+               names_to = c('Group', 'Donor'), 
+               names_prefix = 'Count_', 
+               names_sep = '_') %>%
+  mutate(ETRatio = factor(ETRatio),
+         Donor = factor(Donor),
+         Group = factor(Group,
+                        levels = c("NTC", "WTCAR", "MGAT5CAR")),
+         Count_uncorrected = round(Count, digits = 0) %>% as.integer,
+         fDay = factor(Day)) %>%
+  arrange(Donor, Group, ETRatio, Day) %>%
+  mutate(TechRep = rep(1:2, 90))
+
+dataNTC <- data %>%
+  filter(Group == 'NTC') %>%
+  select(ETRatio, Day, Donor, TechRep, Count_Background = Count_uncorrected)
+
+datamod <- data %>%
+  filter(Group != 'NTC') %>%
+  left_join(., dataNTC) %>%
+  mutate(
+    Count = Count_uncorrected - Count_Background,
+    ID = rep(1:12, each = 10)) 
+
+datacor <- datamod %>%
+  select(-c(fDay, Count_uncorrected, Count_Background)) %>%
+  pivot_wider(names_from = Day, 
+              names_prefix = "Day", 
+              values_from = Count)
+
+data %>% writexl::write_xlsx(here('output/Exp40_coculture.xlsx'))
+rm(Exp40, dataNTC)
+```
+
+# Exploratory data analysis
+
+## Mean structure
+
+```{r EDA}
+datamod %>%
+  group_by(Day, Donor, ETRatio, Group) %>%
+  summarise(mlCount = mean(Count, na.rm = TRUE), 
+            SEM = sd(Count, na.rm = TRUE)/sqrt(sum(!is.na(Count)))) %>%
+  ggplot(aes(x = Day, y = mlCount, group = Group, color = Group)) +
+  geom_point() +
+  geom_line() +
+  geom_errorbar(aes(ymax = mlCount+SEM, ymin = mlCount-SEM), width = 0.5) +
+  facet_grid(ETRatio~Donor, scales = 'free_y') +
+  #scale_y_log10() +
+  theme_bw()
+
+datamod %>%
+  group_by(Day, Donor, ETRatio, Group) %>%
+  summarise(mlCount = mean(Count, na.rm = TRUE), 
+            SEM = sd(Count, na.rm = TRUE)/sqrt(sum(!is.na(Count)))) %>%
+  ggplot(aes(x = Day, y = mlCount, group = Donor, color = Donor)) +
+  geom_point() +
+  geom_line() +
+  geom_errorbar(aes(ymax = mlCount+SEM, ymin = mlCount-SEM), width = 0.5) +
+  facet_grid(ETRatio~Group, scales = 'free_y') +
+  scale_y_log10() +
+  theme_bw()
+
+data %>%
+  filter(Group == 'NTC') %>%
+  group_by(Day, Donor, ETRatio, Group) %>%
+  summarise(mlCount = mean(Count, na.rm = TRUE), 
+            SEM = sd(Count, na.rm = TRUE)/sqrt(sum(!is.na(Count)))) %>%
+  ggplot(aes(x = Day, y = mlCount, group = Donor, color = Donor)) +
+  geom_point() +
+  geom_line() +
+  geom_errorbar(aes(ymax = mlCount+SEM, ymin = mlCount-SEM), width = 0.5) +
+  facet_grid(ETRatio~Group, scales = 'free_y') +
+  scale_y_log10() +
+  theme_bw()
+  
+```
+
+
+## Within-cluster correlation
+
+```{r}
+datacor %>%
+  select(starts_with('Day')) %>%
+  cor(method = "pearson", use = "pairwise.complete.obs")
+
+psych::pairs.panels(
+  datacor %>% select(starts_with('Day')) ,
+  method = "pearson", 
+  density = TRUE,  
+  ellipses = FALSE, 
+  smooth = TRUE, 
+  scale = FALSE
+)
+
+datacor %>%
+  filter(ETRatio == '0.015') %>%
+  select(starts_with('Day')) %>%
+  cor(method = "pearson", use = "pairwise.complete.obs")
+
+psych::pairs.panels(
+  datacor %>% filter(ETRatio == '0.015') %>% select(starts_with('Day')) ,
+  method = "pearson", 
+  density = TRUE,  
+  ellipses = FALSE, 
+  smooth = TRUE, 
+  scale = FALSE
+)
+
+datacor %>%
+  filter(ETRatio == '0.15') %>%
+  select(starts_with('Day')) %>%
+  cor(method = "pearson", use = "pairwise.complete.obs")
+
+psych::pairs.panels(
+  datacor %>% filter(ETRatio == '0.15') %>% select(starts_with('Day')) ,
+  method = "pearson", 
+  density = TRUE,  
+  ellipses = FALSE, 
+  smooth = TRUE, 
+  scale = FALSE
+)
+```
+
+A cluster is defined as all the measurements with common donor, ETRatio and treatment. This means that within a cluster we find 10 measurements (i.e. 5 timepoints * 2 TechReps).
+
+There is a high within-cluster correlation if we look at all the measurements at the same time, however, there is a large difference in counts between ETRatio = 0.15 and ETRatio = 0.015, which inflates the correlation. When we look at the ETRatio groups seperately, correlation is lower but still present. It seems wise to take it into account by using a mixed model. 
+
+# Modeling 
+## Model fitting
+
+For counts, we usually resort to Poisson regression or negative binomial regression, the latter is used when data are overdispersed. We first have a quick check whether the data are overdispersed or not by fitting a quasipoisson model (which allows to check for overdispersion) with all main and two-way interactions.
+
+```{r}
+summary(glm(Count ~ fDay*Group*Donor*ETRatio - 
+              fDay:Group:Donor:ETRatio -
+              fDay:Group:Donor - 
+              fDay:Group:ETRatio -
+              fDay:Donor:ETRatio -
+              Group:Donor:ETRatio,
+            data = datamod, family = quasipoisson(link = "log")))
+
+dispersion <- summary(glm(
+  Count ~ fDay*Group*Donor*ETRatio -
+    fDay:Group:Donor:ETRatio -
+    fDay:Group:Donor -
+    fDay:Group:ETRatio -
+    fDay:Donor:ETRatio -
+    Group:Donor:ETRatio,
+  data = datamod, family = quasipoisson(link = "log")))$dispersion %>% round(., 1)
+```
+
+We see a large overdispersion (dispersion parameter = `r dispersion`). We will fit a negative binomial. 
+We also need to take into account the correlation between timepoints as pointed out above, so we will fit a mixed model version of the negative binomial.The GLMMadaptive package can fit models with adaptive gaussian quadrature (AGQ). Hence we use this package, as AGQ is known to have better properties for fitting GLMM's than Laplace approximation or penalized (quasi) likelihood methods. Added advantage: AGQ is fully likelihood based so we can use likelihood ratio testing for model building (not the case with quasi likelihood methods).
+
+We will start with a fairly complex model.  
+Looking back at the higher plots of the log transformed data (negative binomial uses a log link), we can see that there is a strong effect of ETRatio and Day on the counts. The Day effect is not linear, so we will make day a categorical variable to get separate estimates for every day. The donor effect seems to be generally smaller. There are also possible interaction effects: 
+   - definitely a Day:Group interaction (i.e. difference between groups depends on day)
+   - possibly a Day:Donor interaction (i.e. difference between donors depends on day)
+   - probably not a Donor:Group interaction (i.e. difference between Groups doesn't change with Donor), but we will add it initially and test for it.
+   
+When we start with a random intercept AND slope, we get convergence issues. We use random intercept only. 
+
+```{r}
+mod <- mixed_model(
+  fixed = Count ~ fDay*Group + fDay*Donor + ETRatio, 
+  random = ~ 1|ID,
+  data = datamod, 
+  family = negative.binomial(),
+  control = list(
+    max_coef_value = 25
+  )
+)
+
+mod %>% summary
+```
+
+One of the first things to have a look at is whether the estimates are stable with respect to the number of quadrature points.
+
+```{r}
+mod_q15 <- update(mod, nAGQ = 15)
+mod_q20 <- update(mod, nAGQ = 20)
+mod_q25 <- update(mod, nAGQ = 25)
+
+models <- list('points = 11' = mod, 
+               'points = 15' = mod_q15,
+               'points = 20' = mod_q20, 
+               'points = 25' = mod_q25)
+
+extract <- function (obj) {
+    c(fixef(obj), 
+      "var_(Intercept)" = obj$D[1, 1],
+      "logLik" = logLik(obj))
+}
+
+sapply(models, extract) %>% signif(digits = 3)
+
+```
+
+The estimates seem to be stable with 15 quadrature points. We will use 15 points.  
+
+```{r}
+mod <- mod_q15
+```
+
+First we check if we can remove the random intercept. 
+
+```{r}
+mod_noint <- MASS::glm.nb(data = datamod, Count ~ fDay*Group + fDay*Donor + ETRatio)
+anova(mod, mod_noint)
+cutoff <- anova(mod, mod_noint)$LRT
+pval <- 0.5*((1-pchisq(cutoff, 0)) + (1-pchisq(cutoff, 1))) %>% round(.,3)
+
+```
+
+The random intercept only model is better than the negative binomial model without random effects, p-value = `r pval`. We used a mixture chi square distribution here (since we are testing on the boundary of the parameter space, a normal chi square is actually too liberal).
+
+
+We now test for the fixed effects. since AGQ is maximum likelihood based, we can use likelihood ratio testing (would not be possible with penalized quasi likelihood or GEE).
+
+```{r}
+mod1 <- update(mod, fixed = Count ~ Group + fDay*Donor + ETRatio)
+anova(mod, mod1)
+
+mod2 <- update(mod, fixed = Count ~ fDay*Group + Donor + ETRatio)
+anova(mod, mod2)
+
+mod3 <- update(mod, fixed = Count ~ fDay*Group + fDay*Donor + fDay*ETRatio)
+anova(mod, mod3)
+
+```
+
+All interaction effects are significant. In fact, the interaction between fDay and ETRatio is also significant. 
+We add this term and keep the other interaction terms as well. Do we need to add more interaction terms?
+
+```{r}
+mod4 <- update(mod, fixed = Count ~ fDay*Group + fDay*Donor + fDay*ETRatio + Group*Donor)
+anova(mod3, mod4)
+
+mod5 <- update(mod, fixed = Count ~ fDay*Group + fDay*Donor + fDay*ETRatio + Group*ETRatio)
+anova(mod3, mod5)
+
+mod6 <- update(mod, fixed = Count ~ fDay*Group + fDay*Donor + fDay*ETRatio + Donor*ETRatio)
+anova(mod3, mod6)
+
+```
+It seems that also the Group*Donor interaction is significant. We add this one as well. 
+
+## Model checking
+
+Now we test for goodness of fit using simulated residuals (DHARMa package)
+
+```{r}
+mod <- mod4
+simulationOutput <- simulateResiduals(fittedModel = mod, plot = F)
+plot(simulationOutput)
+```
+
+QQ plot looks pretty good. No over- or underdispersion. Residuals also look good. 
+
+```{r}
+plotResiduals(simulationOutput, datamod$ETRatio)
+plotResiduals(simulationOutput, datamod$Donor)
+plotResiduals(simulationOutput, datamod$Group %>% droplevels)
+plotResiduals(simulationOutput, datamod$fDay)
+```
+
+All of these also look good, except for some heterogeneity of variance along fDay.
+This doesn't seem to be a major concern as variance on day 7, 11 and 14 seem to be more or less the same. 
+
+How does the final model look? 
+
+```{r}
+mod %>% summary
+
+broom.mixed::tidy(mod) %>% 
+  mutate(p.value = ifelse(p.value < 0.001, '<0.001', round(p.value, 3))) %>%
+  mutate(across(is.numeric) %>% round(., 3))
+```
+
+```{r}
+datamod$fitted <- fitted(mod, 'marginal') %>% round(.,0)
+
+datamod %>%
+  group_by(Day, Donor, ETRatio, Group, fitted) %>%
+  summarise(mlCount = mean(Count, na.rm = TRUE), 
+            SEM = sd(Count, na.rm = TRUE)/sqrt(sum(!is.na(Count)))) %>%
+  ggplot(aes(x = Day, y = mlCount, group = Group, color = Group)) +
+  geom_point() +
+  geom_line() +
+  geom_point(aes(y = fitted), color = 'red') +
+  geom_line(aes(y = fitted), color = 'red') +
+  geom_errorbar(aes(ymax = mlCount+SEM, ymin = mlCount-SEM), width = 0.5) +
+  facet_grid(ETRatio~Donor, scales = 'free_y') +
+  #scale_y_log10() +
+  theme_bw()
+```
+
+The predictions (in red) are not perfect, but close enough.
+
+## Inference
+
+Caution: with GLMM's, the parameters are not interpretable on the 'population level'. However, in this particular case, we have a model with a log link and only a random intercept, which means that exceptionally, all parameters except for the intercept are interpretable on the population level. I.e. the parameters can be interpreted as in a marginal model fitted with GEE (which is what we want). (See Fitzmaurice, Laird and Ware, Applied longitudinal analysis, 2nd ed., page 477-478).
+
+Let's now test whether there is a significant effect of the CAR engineering.
+
+```{r}
+library(broom)
+L <- rbind(c(0,0,0,0,0,1,0,0,0,0,
+             1,0,0,0,0,0,0,0,0,0,
+             0,0,0,0,0,1/3,1/3),
+           c(0,0,0,0,0,1,0,0,0,0,
+             0,1,0,0,0,0,0,0,0,0,
+             0,0,0,0,0,1/3,1/3),
+           c(0,0,0,0,0,1,0,0,0,0,
+             0,0,1,0,0,0,0,0,0,0,
+             0,0,0,0,0,1/3,1/3))
+
+rownames(L) <- c("MGAT5 effect, averaged over donors and E/T Ratio, day 7",
+                 "MGAT5 effect, averaged over donors and E/T Ratio, day 11",
+                 "MGAT5 effect, averaged over donors and E/T Ratio, day 14")
+colnames(L) <- names(fixef(mod))
+
+knitr::kable(
+  left_join(
+    multcomp::glht(mod, linfct = L, vcov. = vcov(mod, "fixed"), coef. = fixef) %>% summary %>% tidy,
+    multcomp::glht(mod, linfct = L, vcov. = vcov(mod, "fixed"), coef. = fixef) %>% confint %>% tidy
+  ) %>%
+    mutate(Estimate = exp(estimate),
+           `95% CI, lower` = exp(conf.low),
+           `95% CI, upper` = exp(conf.high),
+           `Adj. p-value` = ifelse(adj.p.value < 0.001, 
+                                "<0.001", 
+                                round(adj.p.value, 3))) %>%
+    mutate(across(is.numeric) %>% round(., 2)) %>%
+    select(-null.value) %>%
+    select(Contrast = contrast,
+           Estimate,
+           `95% CI, lower`,
+           `95% CI, upper`,
+           `Adj. p-value`)) %>% 
+  kableExtra::kable_styling()
+
+```
+
+We can see that according to the model, the number of CAR T cells on day 11 and 14 is about 1.7 times higher when MGAT5 is knocked out compared to using non-engineered CAR T cells. The estimates are averaged over 3 donors and 2 E/T ratio conditions. The p-values indicate whether the estimate is significantly different from 1.
+
+# Statistical methods coculture experiment
+
+To analyze the data of the coculture experiment, we started from flow cytometry-based count data. Since the counts have been normalized using counting beads, they were not necessarily integers so we rounded all data to the closest integer. We considered each setup with the same donor, E/T Ratio and type of CAR T cells (i.e. CD70 nanoCAR or CD70 nanoCAR MGAT5 KO) as a cluster. Since we had two measurements (repeats) at each day and the measurements were performed at day 0, 4, 7, 11 and 14, this means we had 10 measurements in each cluster. Furthermore, we observed a slight rise in the counts of the NTC cells over time in the control setups. We corrected the CAR T cell counts for this background (per cluster and at each timepoint) by subtracting the mean background count from the measurements. 
+We analyzed the background-corrected counts with a generalized linear mixed model (GLMM) to allow for modeling the within-cluster correlation over time. Since the data showed considerable overdispersion, we used a negative binomial model. The GLMMadaptive package [ref GLMMadaptive] allows to fit such a model in R [ref R] using adaptive Gaussian quadrature (AGQ). We did not have enough data to fit a random slope model, so we settled for a random intercept model of the following form: 
+  Count ~ fDay*Group + fDay*Donor + fDay*ETRatio + Group*Donor + (1|ID)
+In this model, all fixed effects are coded as a factor. We chose to also model the time variable as a factor since the log-transformed counts are not linear with time. The model fit was evaluated using the DHARMa package [ref DHARMa] and contrasts were estimated using the multcomp package [ref multcomp]. 
+
+
+```{r}
+citation()
+citation('GLMMadaptive')
+citation('DHARMa')
+citation('multcomp')
+
+```
+

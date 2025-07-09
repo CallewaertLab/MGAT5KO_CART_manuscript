@@ -1,0 +1,283 @@
+---
+title: ""
+author: "Leander Meuris"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+here::i_am("analysis/SKOV3_cellcounts.Rmd")
+library(here)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(broom)
+library(ggplot2)
+library(ggbeeswarm)
+library(modelr)
+library(stringr)
+library(glmmTMB)
+options(knitr.kable.NA = "")
+```
+
+# Data
+
+The data are from a flow cytometry experiment which analyzed the number of CART cells in the blood or spleen of mice carrying a tumor and treated with different versions of CAR T-cells or controls. The following variables are in the dataset:
+
+  - Experiment: from which experiment are the data (Exp 30, 32, 43)
+  - Timepoint: from which moment in the experiment? We have "Early", "Mid" and "Late", corresponding to around day 35, 85 and 120. 
+  - Treatment: mice received no CAR T-cells (PBS, NTC, None), CAR T-cells but no MGAT5 engineering (CD70 nanoCAR-neg and CD70 nanoCAR-WT) or CAR T-cells which were MGAT5 KO (CD70 nanoCAR-MGAT5 KO)
+  - CellCount: the number of cells found in a spleen or in 1 ul blood. 
+  - Location: whether spleen or blood was analyzed. 
+
+```{r}
+data <- read_xlsx(here('data/FACSdata_clean.xlsx'))
+
+data <- data %>%
+  filter(!is.na(CellCount))
+```
+
+Make a group variable, indicating no CAR, CAR or CAR with MGAT5 KO.
+Then make 6 subsets of the data: Spleen and Blood, each early, mid, late. 
+
+```{r}
+data <- data %>%
+  mutate(
+    Group = factor(case_when(
+      Treatment %in% c('PBS', 'NTC', 'None') ~ 'Control',
+      Treatment %in% c('CD70 nanoCAR-neg', 'CD70 nanoCAR-WT') ~ 'CAR',
+      Treatment == 'CD70 nanoCAR-MGAT5 KO' ~ 'MGAT5KO_CAR'), 
+      levels = c('Control', 'CAR', 'MGAT5KO_CAR'), 
+      labels = c('WT T-cells or None', 'CD70 nanoCAR', 'CD70 nanoCAR - MGAT5 KO')),
+    TimePoint = factor(TimePoint, levels = c('Early', 'Mid', 'Late'), 
+                       labels = c('Early', 'Mid', 'Endpoint')),
+    Experiment = factor(
+      Experiment,
+      levels = c('Exp30', 'Exp32', 'Exp43'),
+      labels = c('Experiment A', 'Experiment B', 'Experiment C')),
+    Location = factor(Location))
+```
+
+We note that cell counts can be lower than 1 if we look in blood. 
+For cell counts we would like to use a Poisson or Negative binomial model, however, these don't work well with non-integers. So we will work with the number of cells per ml blood and round to the nearest integer. 
+
+For spleens, we don't have counts below 1, so there we just round to the nearest integer.
+
+```{r}
+data <- data %>%
+  mutate(CellCount = ifelse(Location == 'Blood',
+                            (1000*CellCount) %>% round(., 0),
+                            CellCount %>% round(., 0)))
+
+data <- data %>%
+  mutate(CellCountPlotting = CellCount)
+```
+
+# Exploratory data analysis
+
+Plot the data by experiment and timepoint. First for blood data, then for spleen data.
+We also use a pseudo-log-scale y axis to better see differences. 
+(A pseudo log-scale uses a log scale for large values but gradually becomes a linear scale for small values)
+
+```{r}
+BloodBoxplots <- data %>%
+  filter(Location == 'Blood') %>%
+  ggplot(aes(x = Group, y = CellCountPlotting, color = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_line(aes(group = ID)) +
+  geom_jitter(alpha = 0.4, width = 0.2) +
+  facet_grid(Experiment~TimePoint) +
+  scale_y_continuous(trans = 'pseudo_log', 
+                     breaks = c(0,5,25,150,1000,10000,100000)) +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  theme_bw() +
+  scale_colour_manual(values = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  labs(y = 'Cells per ml of blood')
+
+SpleenBoxplots <- data %>%
+  filter(Location == 'Spleen') %>%
+  ggplot(aes(x = Group, y = CellCountPlotting, color = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(alpha = 0.4, width = 0.2) +
+  facet_grid(Experiment~TimePoint) +
+  scale_y_continuous(trans = 'pseudo_log', 
+                     breaks = c(0,5,25,150,1000,10000,100000)) +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  theme_bw() +
+  scale_colour_manual(values = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  labs(y = 'Cells per Spleen')
+
+ggsave(here("output/BloodBoxplots.pdf"), BloodBoxplots,
+       device = "pdf", height = 8, width = 8, dpi=600)
+ggsave(here("output/SpleenBoxplots.pdf"), SpleenBoxplots,
+       device = "pdf", height = 8, width = 8, dpi=600)
+
+BloodBoxplots
+SpleenBoxplots
+
+```
+
+```{r}
+data %>%
+  filter(Location == 'Blood') %>%
+  ggplot(aes(x = Experiment, y = CellCountPlotting, fill = Group)) +
+  geom_boxplot(aes(color = Group)) +
+  scale_y_continuous(trans = 'pseudo_log',
+                     breaks = c(0,5,25,150,1000,10000,100000)) +
+  facet_wrap(~TimePoint) +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  theme_bw() +
+  scale_fill_manual(values = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  scale_color_manual(values = c('grey20','grey20', 'grey20')) +
+  labs(y = 'Cells per ml of blood')
+```
+
+# Models comparing MGAT5 vs WT per timepoint
+
+Prepare data
+
+```{r}
+modeldata <- data %>%
+  group_by(Location, TimePoint, Experiment) %>%
+  nest()
+```
+
+Run models and output results of contrasts
+```{r}
+# Running the models
+modeldata <- modeldata %>%
+  rowwise() %>%
+  mutate(mod = list(glm(CellCount ~ Group, data = data, family = quasipoisson)),
+         summ = list(summary(mod)), 
+         Omnibus = list(car::Anova(mod, type = 2)),
+         Coefnames = list(names(coef(mod))),
+         ContMat = list(
+           matrix((-1)*((str_detect(Coefnames, 'nanoCAR') %>% as.numeric) - 
+                    (2*(str_detect(Coefnames, 'MGAT5') %>% as.numeric))), 
+                               nrow = 1, 
+                               ncol = length(Coefnames),
+                               dimnames = list('MGAT5 vs nanoCAR WT',
+                                               Coefnames))),
+         Table = list(left_join(
+           multcomp::glht(mod, linfct = ContMat) %>% summary %>% tidy,
+           multcomp::glht(mod, linfct = ContMat) %>% confint %>% tidy) %>%
+             mutate(`Adj. p-value` = ifelse(
+               adj.p.value < 0.001, "<0.001", round(adj.p.value, 3)) %>% as.character) %>%
+             mutate(across(where(is.numeric)) %>% exp(.) %>% round(., 2)) %>%
+             select(-null.value) %>%
+             select(contrast, estimate,`95% CI, lower` = conf.low, `95% CI, upper` = conf.high,`Adj. p-value`)))
+
+knitr::kable(modeldata %>%
+               unnest(Table) %>%
+               select(Experiment, TimePoint, contrast, estimate, `95% CI, lower`, `95% CI, upper`, `Adj. p-value`) %>%
+               arrange(TimePoint, Experiment))
+```
+
+# Data summary
+
+We plot the summary data per organ and time phase. 
+
+```{r}
+BloodSummaryBoxplots <- data %>%
+  filter(Location == 'Blood') %>%
+  ggplot(aes(x = Group, y = CellCount, color = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(alpha = 0.5, width = 0.2, aes(shape = Experiment)) +
+  facet_wrap(~TimePoint) +
+  scale_y_continuous(trans = 'sqrt', breaks = c(0, 1000, 5000, 10000, 20000, 40000, 60000)) +
+  theme_bw() +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  scale_colour_manual(values = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  labs(y = 'Cells per ml of blood')
+
+SpleenSummaryBoxplots <- data %>%
+  filter(Location == 'Spleen') %>%
+  ggplot(aes(x = Group, y = CellCount, color = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(alpha = 0.6, width = 0.1, aes(shape = Experiment)) +
+  facet_grid(~TimePoint) +
+  scale_y_continuous(trans = 'sqrt', breaks = c(0, 10000, 50000, 100000, 200000, 400000, 600000)) +
+  theme_bw() +
+  scale_colour_manual(values = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  labs(y = 'Cells per Spleen')
+
+ggsave(here("output/BloodSummaryBoxplots.pdf"), BloodSummaryBoxplots,
+       device = "pdf", height = 5, width = 12, dpi=600)
+ggsave(here("output/SpleenSummaryBoxplots.pdf"), SpleenSummaryBoxplots,
+       device = "pdf", height = 5, width = 12, dpi=600)
+```
+
+```{r}
+data %>%
+  filter(Location == 'Blood') %>%
+  ggplot(aes(x = Group, y = CellCountPlotting, color = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(alpha = 0.5, width = 0.2, aes(shape = Experiment)) +
+  facet_wrap(~TimePoint) +
+  scale_y_log10() +
+  theme_bw() +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  scale_colour_manual(values = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  labs(y = 'Cells per ml of blood')
+
+data %>%
+  filter(Location == 'Spleen') %>%
+  droplevels %>%
+  ggplot(aes(x = Group, y = CellCountPlotting, color = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(alpha = 0.5, width = 0.2, aes(shape = Experiment)) +
+  facet_wrap(~TimePoint) +
+  scale_y_log10() +
+  theme_bw() +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  scale_colour_manual(values = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  labs(y = 'Cells per ml of blood')
+```
+
+# Materials and Methods
+
+To analyse the FACS-based cell-count data of three separate experiments, we ran separate models for each combination of time-point (Early, Mid, Late/Endpoint), source (Blood or Spleen) and donor (= experiment). We don't have data available for all combinations of factors: for Blood, data is lacking on non-engineered cells for the Mid timepoint in experiment A and C. For Spleen we don't have any data for the Mid timepoint and we only have data from experiment A for the Early timepoint. Consequently, no models were run for these settings.
+
+We ran quasipoisson models in R [ref], using the glm function with Cell Counts as the outcome variable and Group as predictor. An omnibus test for the main effects was performed using the Anova function (car package [ref]) with type 2 sums of squares. Next, we tested the specific contrast of MGAT5 engineered anti-CD70 nanoCAR T cells versus WT nanoCAR T cells. The contrast estimates, p-values and 95% confidence intervals were calculated using the multcomp package [ref].
+
+For reference; settings for which no data are available: 
+```{r}
+knitr::kable(data %>%
+  group_by(Location, TimePoint, Experiment, Group, .drop = FALSE) %>%
+  count(.drop = FALSE) %>%
+  filter(n == 0))
+```
+
+ 
+
+
+```{r}
+citation()
+citation('car')
+citation('multcomp')
+```
+
