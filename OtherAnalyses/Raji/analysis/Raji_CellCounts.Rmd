@@ -13,12 +13,21 @@ library(readxl)
 library(writexl)
 library(tidyverse)
 library(ggh4x)
+library(ggbeeswarm)
 options(tibble.print_max = Inf, tibble.print_min = Inf)
+
+pseudo_log <-  function(x, sigma = 1, base = 10) {
+  asinh(x / (2 * sigma)) / log(base)
+}
+
+inv_pseudo_log <- function(x, sigma = 1, base = 10) {
+  2 * sigma * sinh(x * log(base))
+}
 ```
 
 # Description of experiments
 
-Purpose of the experiment is to look at the effect of MGAT5 engineering in CART-cells in a mouse tumor model. The model uses Raji cells, which create blood tumors of the Burkitt's lymphoma type. These cells are CD19, CD20 and CD70 positive.  
+Purpose of the experiment is to look at the effect of MGAT5 engineering in CART-cells in a mouse tumor model. The model uses Raji cells, which create blood tumors of the Burkitt lymphoma type. These cells are CD19, CD20 and CD70 positive.  
 
 The experiment has the following timeline:
 
@@ -53,21 +62,33 @@ Experiment 74: used 6 mice per group, and no CD19 CART cells:
   - CD70 CART MGAT5 4 million cells
  
 
-Summarizing we can say that: 
+Summary: 
 
   1) The target is CD70
-  2) different amounts of CART cells have been injected; 0.5, 2 or 4 million
-  3) CART cells were either engineered or not to have MGAT5 knocked out
+  2) different doses of CART cells have been injected; 0.5, 2 or 4 million
+  3) CART cells were either engineered or not to have MGAT5 KO
   
 There was a rechallenge part to experiments 51 and 74, but not to 62 and 68. 
 A rechallenge means that tumor cells were administered again after a set period.
+
+```{r}
+day_rechallenge_E51 <- 133
+day_rechallenge_E62 <- NA
+day_rechallenge_E68 <- NA
+day_rechallenge_E74 <- 139
+
+day_end_E51 <- 216
+day_end_E62 <- 83
+day_end_E68 <- 88
+day_end_E74 <- 202
+```
 
 # Data
 
 The data are from a flow cytometry experiment which analyzed the number of CART cells in the blood of mice in the Raji tumor model treated with different versions of CAR T-cells or controls. The following variables are in the dataset:
 
   - Experiment: from which experiment are the data (E51, E62, E68 and E74)
-  - Day: at which day was blood sampled? We have 2 or 
+  - Day: at which day was blood sampled? We have 2 or 4
    timepoints, depending on the experiment. Around day 20, around day 90, around day 150 and around day 200.
   - Treatment: mice received no CAR T-cells (PBS, NTC, None), CAR T-cells but no MGAT5 engineering (CD70 nanoCAR-neg and CD70 nanoCAR-WT) or CAR T-cells which were MGAT5 KO (CD70 nanoCAR-MGAT5 KO). Specifically in experiment 51, there was a test for doses of treatment. We will remove those cases where the dose does not correspond to the other experiments. 
   - CellCount: the number of cells found in a spleen or in 1 ul blood. 
@@ -78,10 +99,12 @@ data <- read_xlsx(here('data/data_counts_cleaned.xlsx'))
 ```
 
 Cleaning: remove sentinel mice
+Cleaning: remove 'No Raji' controls
 
 ```{r}
 data <- data %>%
-  filter(Treatment != 'sentinel')
+  filter(Treatment != 'sentinel') %>%
+  filter(!str_detect(Treatment, 'No Raji'))
 ```
 
 Cleaning: remove treatments in exp 51 that were for dose finding and not repeated in other experiments.
@@ -101,21 +124,22 @@ data <- data %>%
   mutate(Treatment = str_remove(Treatment, 'Raji \\+ '))
 ```
 
-
 What is left now? 
 
 ```{r}
 data$Treatment %>% unique
 ```
 
-Rename treatments that are identical but have a different name to have the same names.
+Rename treatments that are identical but have a different name.
 
 ```{r}
 data <- data %>%
   mutate(Treatment = case_when(
     Treatment == 'NTC' ~ 'NTC',
     Treatment %in% c('CD70 WT CAR', 'CD70 nanoCAR - neg ctrl')  ~ 'CD70 nanoCAR MGAT5 WT',
-    Treatment %in% c('CD70 M5KO CAR', 'CD70 nanoCAR - MGAT5 KO')  ~ 'CD70 nanoCAR MGAT5 KO'
+    Treatment %in% c('CD70 M5KO CAR', 'CD70 nanoCAR - MGAT5 KO')  ~ 'CD70 nanoCAR MGAT5 KO',
+    Treatment %in% c('CD19 CAR - mock') ~ 'CD19 nanoCAR MGAT5 WT',
+    Treatment %in% c('CD19 CAR - MGAT5 KO') ~ 'CD19 nanoCAR MGAT5 KO'
   ))
 ```
 
@@ -133,13 +157,13 @@ data <- data %>%
   mutate(
     Group = factor(case_when(
       Treatment %in% c('NTC') ~ 'Control',
-      Treatment %in% c('CD70 nanoCAR MGAT5 WT', 'CD20 nanoCAR MGAT5 WT') ~ 'CAR',
-      Treatment %in% c('CD70 nanoCAR MGAT5 KO', 'CD20 nanoCAR MGAT5 KO') ~ 'MGAT5KO_CAR'), 
+      Treatment %in% c('CD70 nanoCAR MGAT5 WT', 'CD19 nanoCAR MGAT5 WT') ~ 'CAR',
+      Treatment %in% c('CD70 nanoCAR MGAT5 KO', 'CD19 nanoCAR MGAT5 KO') ~ 'MGAT5KO_CAR'), 
       levels = c('Control', 'CAR', 'MGAT5KO_CAR'), 
       labels = c('NTC', 'MGAT5 WT', 'MGAT5 KO')),
     Target = factor(case_when(
       Treatment %in% c('NTC') ~ 'NTC', 
-      Treatment %in% c('CD20 nanoCAR MGAT5 WT', 'CD20 nanoCAR MGAT5 KO') ~ 'CD20',
+      Treatment %in% c('CD19 nanoCAR MGAT5 WT', 'CD19 nanoCAR MGAT5 KO') ~ 'CD19',
       Treatment %in% c('CD70 nanoCAR MGAT5 WT', 'CD70 nanoCAR MGAT5 KO') ~ 'CD70')),
     TimePoint = factor(case_when(
       Day < 40 ~ 1, 
@@ -148,16 +172,37 @@ data <- data %>%
       Day > 180 ~ 4)),
     Experiment = factor(
       Experiment,
-      levels = c('E51', 'E62', 'E68', 'E74')))
+      levels = c('E51', 'E62', 'E68', 'E74', 'E91', 'E97')),
+    ID = paste0(Experiment, 'M', Mouse),
+    TumorPresent = factor(TumorPresent))
 ```
 
-We note that cell counts can be lower than 1 if we look in blood. 
+We note that cell counts (which are in cells / µl) can be lower than 1 if we look in blood. 
 For cell counts we would like to use a Poisson or Negative binomial model, however, these don't work well with non-integers. So we will work with the number of cells per ml blood and round to the nearest integer. 
 
 ```{r}
 data <- data %>%
   mutate(CellCount = (1000*CellCount_pul) %>% round(., 0))
 ```
+
+Add column that indicates whether mice had tumor at secondary timepoint
+
+```{r}
+tftp2 <- data %>%
+  filter(TimePoint == 2) %>%
+  group_by(ID) %>%
+  summarise(Tumorfree_tp2 = case_when(
+    TumorPresent == 1 ~ 0,
+    TumorPresent == 0 ~ 1
+  ))
+
+data <- left_join(data, tftp2) %>%
+  mutate(Tumorfree_tp2 = case_when(
+    Tumorfree_tp2 == 1 ~ 'Tumorfree at TP2', 
+    is.na(Tumorfree_tp2) | Tumorfree_tp2 == 0 ~ 'Died by TP2 or tumor at TP2'
+  ))
+```
+
 
 # Exploratory data analysis
 
@@ -169,7 +214,8 @@ We use a pseudo-log-scale y axis to better see differences.
 
 ```{r}
 CD70_box <- data %>%
-  filter(Target %in% c('NTC', 'CD70')) %>%
+  filter(Target == 'CD70') %>%
+  filter(Experiment %in% c('E51', 'E62', 'E68', 'E74')) %>%
   filter(TimePoint %in% c(1,2)) %>%
   ggplot(aes(x = Group, y = CellCount, color = Group)) +
   geom_boxplot(outlier.shape = NA) +
@@ -179,7 +225,7 @@ CD70_box <- data %>%
   scale_x_discrete(guide = guide_axis(angle = 90)) +
   theme_bw() +
   scale_colour_manual(values = c(
-    rgb(44,20,83, maxColorValue = 255), 
+    #rgb(44,20,83, maxColorValue = 255), 
     rgb(14,111,124, maxColorValue = 255),
     rgb(251,79,6, maxColorValue = 255))) +
   labs(y = 'Cells per ml of blood') +
@@ -198,7 +244,7 @@ CD70_box <- data %>%
                 labels = (c(0,40,80,120,160,200))^2) +
   theme(panel.grid.minor = element_blank())
 
-ggsave(here("output/BloodBox_Raji_CD70.pdf"), CD70_box,
+ggsave(here("output/CellCountsBoxplot_CD70_Raji_PerExp_byTimePoint.pdf"), CD70_box,
        device = "pdf", height = 8, width = 10, dpi=600)
 
 CD70_box
@@ -209,12 +255,58 @@ Number of mice:
 ```{r}
 data %>%
   filter(Target %in% c('NTC', 'CD70')) %>% 
+  filter(Experiment %in% c('E51', 'E62', 'E68', 'E74')) %>%
   group_by(TimePoint, Group, Experiment) %>%
   count()
 ```
 
+## Plot for CD19
+
+```{r}
+CD19_box <- data %>%
+  filter(Target == 'CD19') %>%
+  filter(TimePoint %in% c(1)) %>%
+  ggplot(aes(x = Group, y = CellCount, color = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.5) +
+  facet_grid2(Experiment~TimePoint, scales = 'free_y') +
+  scale_y_continuous(trans = 'sqrt') +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  theme_bw() +
+  scale_colour_manual(values = c(
+    #rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  labs(y = 'Cells per ml of blood') +
+  ggtitle('CD19 nanoCAR, counts of GFP+ cells') +
+  scale_y_facet(Experiment == 'E91', 
+                breaks = c(0,100,200,300,400),
+                labels = (c(0,100,200,300,400))^2) +
+  scale_y_facet(Experiment == 'E97', 
+                breaks = c(0,100,200,300,400),
+                labels = (c(0,100,200,300,400))^2) +
+  theme(panel.grid.minor = element_blank())
+
+ggsave(here("output/CellCountsBoxplot_CD19_Raji_PerExp_byTimePoint.pdf"), CD19_box,
+       device = "pdf", height = 8, width = 10, dpi=600)
+
+CD19_box
+```
+
+Number of mice:
+
+```{r}
+data %>%
+  filter(Target %in% c('NTC', 'CD19')) %>% 
+  filter(Experiment %in% c('E91', 'E97')) %>%
+  group_by(TimePoint, Group, Experiment) %>%
+  count()
+```
+
+# Models
+
 We will now continue with modeling the counts: 
-  - We model CD20 and CD70 data separately, each time using the same NTC.
+  - We model CD19 and CD70 data separately, each time using the same NTC.
   - We model each time-point separately. 
   - We only make a contrast for MGAT5 WT vs MGAT5 KO. 
   
@@ -228,7 +320,7 @@ The interaction term in the model is warranted in the light of donor effects. Ea
 
 We will model these data with a quasipoisson model, which is suited for overdispersed count data and uses a log-link. 
 
-# Models
+## CD70
 
 plot data for which we are going to test
 
@@ -236,12 +328,12 @@ plot data for which we are going to test
 data %>%
   filter(Target %in% c('CD70')) %>%
   filter(TimePoint %in% c(1,2)) %>%
-  ggplot(aes(x = Group, y = CellCount, color = Group)) +
-  geom_boxplot(outlier.shape = NA) +
-  geom_jitter(width = 0.2) +
-  facet_grid(Target~Experiment*TimePoint) +
-  scale_y_sqrt() +
-  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  ggplot(aes(x = TimePoint, y = CellCount)) +
+  geom_line(aes(group = ID)) +
+  geom_beeswarm(alpha = 0.6, aes(color = TumorPresent)) +
+  ggh4x::facet_nested(Experiment ~ Tumorfree_tp2+Group) +
+  scale_y_continuous(transform = 'pseudo_log', 
+                     breaks = c(0,1,10,100,1000,10000,100000,1000000)) +
   theme_bw() +
   labs(y = 'Cells per ml of blood') +
   theme(panel.grid.minor = element_blank())
@@ -263,17 +355,136 @@ modeldata <- modeldata %>%
   filter(length(unique(data$Treatment))==2) %>%
   mutate(model = list(glm(CellCount ~ Group, data = data, family = quasipoisson)),
          logFC = model$coefficients['GroupMGAT5 KO'] %>% as.numeric, 
-         pval = summary(model)$coefficients['GroupMGAT5 KO','Pr(>|t|)'])
+         pval = summary(model)$coefficients['GroupMGAT5 KO','Pr(>|t|)'],
+         data = list(data %>% mutate(
+           pred = predict(model, type = 'response'))))
 
 modeldata %>%
   select(Experiment, Target, TimePoint, pval) %>%
   arrange(Target, Experiment, TimePoint) %>%
-  mutate(pvals = ifelse(pval<0.001, '<0.001', round(pval, 3))) %>%
-  write_xlsx(here('output/Raji_M5KOvsWT_CellCount_tests.xlsx'))
-
-modeldata
+  ungroup() %>%
+  mutate(pval = ifelse(pval<0.001, '<0.001', round(pval, 3))) %>%
+  write_xlsx(here('output/CellCountTests_CD70_Raji_M5vsWT.xlsx'))
 ```
 
+Model predictions
+
+```{r}
+modeldata$ID <- 1:nrow(modeldata)
+
+data_aug <- bind_rows(modeldata$data, .id = "ID") %>%
+  mutate(ID = as.numeric(ID))
+
+data_aug <- left_join(data_aug, modeldata %>% select(ID, Experiment, Target, TimePoint))
+  
+BloodPlots <- data_aug %>%
+  ggplot(aes(x = Group, y = CellCount, color = Group)) +
+  geom_errorbar(aes(y = pred, color = Group, ymin = pred, ymax = pred)) +
+  geom_jitter(alpha = 0.4, width = 0.2) +
+  facet_grid2(Experiment~TimePoint, scales = 'free_y') +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  scale_y_continuous(trans = 'sqrt') +
+  theme_bw() +
+  scale_colour_manual(values = c(
+    #rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  scale_y_facet(Experiment == 'E51', 
+                limits = c(0, 1200),
+                breaks = c(0,200,400,600,800,1000),
+                labels = (c(0,200,400,600,800,1000))^2) +
+  scale_y_facet(Experiment == 'E62', 
+                limits = c(0, 120),
+                breaks = c(0,20,40,60,80,100),
+                labels = (c(0,20,40,60,80,100))^2) +
+  scale_y_facet(Experiment == 'E68', 
+                limits = c(0, 270),
+                breaks = c(0,50,100,150,200,250),
+                labels = (c(0,50,100,150,200,250))^2) +
+  scale_y_facet(Experiment == 'E74', 
+                limits = c(0, 220),
+                breaks = c(0,40,80,120,160,200),
+                labels = (c(0,40,80,120,160,200))^2) +
+  labs(y = 'Cells per ml of blood')
+
+BloodPlots
+
+ggsave(here("output/CellCountMedianPlots_CD70_Raji_PerExp_byTimePoint.pdf"), BloodPlots,
+       device = "pdf", height = 8, width = 8, dpi=600)
+
+```
+
+Plots are on the log scale, with observed data as dots and model predictions as lines. These lines are the predicted mean of each group. Plotted on the log scale, these tend to look 'too high', especially with right skew data, but are actually correct log transformed means. On the original scale they would look like correct means.
+
+## CD19
+
+```{r}
+modeldata <- data %>%
+  filter(Target %in% c('CD19')) %>%
+  filter(TimePoint %in% c(1)) %>%
+  group_by(Target, Experiment, TimePoint) %>%
+  nest() %>%
+  mutate(data = purrr::map(data, ~.x %>% droplevels()))
+```
+
+```{r}
+modeldata <- modeldata %>%
+  rowwise() %>%
+  filter(length(unique(data$Treatment))==2) %>%
+  mutate(model = list(glm(CellCount ~ Group, data = data, family = quasipoisson)),
+         logFC = model$coefficients['GroupMGAT5 KO'] %>% as.numeric, 
+         pval = summary(model)$coefficients['GroupMGAT5 KO','Pr(>|t|)'],
+         data = list(data %>% mutate(
+           pred = predict(model, type = 'response'))))
+
+modeldata %>%
+  select(Experiment, Target, pval) %>%
+  arrange(Target, Experiment, TimePoint) %>%
+  ungroup() %>%
+  mutate(pval = ifelse(pval<0.001, '<0.001', round(pval, 3))) %>%
+  write_xlsx(here('output/CellCountTests_CD19_Raji_M5vsWT.xlsx'))
+```
+
+Model predictions
+
+```{r}
+modeldata$ID <- 1:nrow(modeldata)
+
+data_aug <- bind_rows(modeldata$data, .id = "ID") %>%
+  mutate(ID = as.numeric(ID))
+
+data_aug <- left_join(data_aug, modeldata %>% select(ID, Experiment, Target, TimePoint))
+  
+BloodPlots <- data_aug %>%
+  ggplot(aes(x = Group, y = CellCount, color = Group)) +
+  geom_errorbar(aes(y = pred, color = Group, ymin = pred, ymax = pred)) +
+  geom_jitter(alpha = 0.4, width = 0.2) +
+  facet_grid2(Experiment~TimePoint, scales = 'free_y') +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  scale_y_continuous(trans = 'sqrt') +
+  theme_bw() +
+  scale_colour_manual(values = c(
+    #rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  scale_y_facet(Experiment == 'E91', 
+                limits = c(0, 500),
+                breaks = c(0,100,200,300,400),
+                labels = (c(0,100,200,300,400))^2) +
+  scale_y_facet(Experiment == 'E97', 
+                limits = c(0, 500),
+                breaks = c(0,100,200,300,400),
+                labels = (c(0,100,200,300,400))^2) +
+  labs(y = 'Cells per ml of blood')
+
+BloodPlots
+
+ggsave(here("output/CellCountMedianPlots_CD19_Raji_PerExp_byTimePoint.pdf"), BloodPlots,
+       device = "pdf", height = 6, width = 6, dpi=600)
+
+```
+
+Plots are on the log scale, with observed data as dots and model predictions as lines. These lines are the predicted mean of each group. Plotted on the log scale, these tend to look 'too high', especially with right skew data, but are actually correct log transformed means. On the original scale they would look like correct means.
 
 # Materials and Methods
 

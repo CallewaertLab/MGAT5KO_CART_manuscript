@@ -20,13 +20,14 @@ library(gtsummary)
 
 # Description of experiments
 
-Purpose of the experiment is to look at the effect of MGAT5 engineering in CART-cells in a mouse tumor model. The model uses Raji cells, which create blood tumors of the Burkitt's lymphoma type. These cells are CD70 positive.  
+Purpose of the experiment is to look at the effect of MGAT5 engineering in CART-cells in a mouse tumor model. The model uses Raji cells, which create blood tumors of the Burkitt's lymphoma type. These cells are CD19, CD20 and CD70 positive.  
 
 The experiment has the following timeline:
 
   - day 0: injection of 500 000 Raji cells IV
-  - day 6: IVIS baseline measurement
-  - day 7: treatment (CAR T injection iv in different doses and controls)
+  - around day 6: IVIS baseline measurement
+  - around day 7: treatment (CAR T injection ivin different doses and controls)
+  - around day 133: rechallenge in some targets
   
 The mice are followed up via body weight measurements and IVIS data, which measures luminescence of the Raji cells in the mice. IVIS measurements are taken at set days (every 3 or 4 days) and mice weights are recorded every 2 days. There are 4 experiments, each with 5 mice per group. 
 
@@ -52,35 +53,42 @@ Experiment 74: used 6 mice per group, and no CD19 CART cells:
   - CD70 CART WT 4 million cells
   - CD70 CART MGAT5 4 million cells
 
-  
+Experiment 91 and 97
 
+  - NTC 
+  - CD19 CART WT
+  - CD19 CART MGAT5
+  
 Summarizing we can say that: 
 
-  1) The target is CD70
+  1) there are 3 CART targets: CD19, CD20, CD70
   2) different amounts of CART cells have been injected; 0.5, 2 or 4 million
   3) CART cells were either engineered or not to have MGAT5 knocked out
   
-There was a rechallenge part to experiments 51 and 74, but not to 62 and 68. 
-A rechallenge means that tumor cells were administered again after a set period.
+There was a rechallenge part to experiments 51 and 74, but not to 62 and 68. No data yet on exp 91 or 97, experiments still running. A rechallenge means that tumor cells were administered again after a set period.
 We also note the end-day of the experiments, as we need this for calculations of the survival times.
+Experiment 91 and 97 are still running, so no end days yet there either. To allow calculations, we set it to the last known day.  
 
 ```{r}
 day_rechallenge_E51 <- 133
 day_rechallenge_E62 <- NA
 day_rechallenge_E68 <- NA
 day_rechallenge_E74 <- 139
+day_rechallenge_E91 <- NA
+day_rechallenge_E97 <- NA
 
-day_end_E51 <- 216
+day_end_E51 <- 215
 day_end_E62 <- 83
 day_end_E68 <- 88
 day_end_E74 <- 202
+day_end_E91 <- 25
+day_end_E97 <- 74
 ```
 
 The question we want to answer are:
 
 Is the MGAT5 effect tumor model independent? I.e. do we see an MGAT5 effect in these experiments like we saw in the SKOV3 tumor model? 
 
-  
 In this particular script, we will focus on the survival analysis.
 
 # Data
@@ -115,7 +123,7 @@ In the survival data;
 ## Weight data
 Get the bodyweight data for each experiment,
 Put in long format,
-Combine data from 4 experiments into one large dataframe,
+Combine data from 6 experiments into one large dataframe,
 Remove lines with missing weight data
 Select relevant columns and sort
 
@@ -181,7 +189,7 @@ Weight <- Weight %>%
   mutate(Experiment = factor(Experiment), 
          ID = fct_inorder(paste0(Experiment, 'M', Mouse)), 
          Treatment = factor(Treatment), 
-         Target = factor(Target, levels =c('Ctrl', 'CD70')), 
+         Target = factor(Target, levels =c('Ctrl', 'CD70', 'CD19')), 
          MGAT5 = factor(MGAT5, levels = c('Ctrl', 'MGAT5WT', 'MGAT5KO')),
          Dose = factor(Dose, levels = c('0','1','0.5','2','4'))) %>%
   select(Experiment, Mouse, ID, everything())
@@ -195,7 +203,7 @@ Survival <- Survival %>%
   mutate(Experiment = factor(Experiment), 
          ID = fct_inorder(paste0(Experiment, 'M', Mouse)), 
          Treatment = factor(Treatment), 
-         Target = factor(Target, levels =c('Ctrl', 'CD70')), 
+         Target = factor(Target, levels =c('Ctrl', 'CD70', 'CD19')), 
          MGAT5 = factor(MGAT5, levels = c('Ctrl', 'MGAT5WT', 'MGAT5KO')),
          Dose = factor(Dose, levels = c('0','0.5','1','2','4'))) %>%
   select(Experiment, Mouse, ID, everything())
@@ -214,7 +222,9 @@ FUtimes_1 <- Weight %>%
   mutate(Time_FU_1 = case_when(
     Experiment == 'E51' ~ pmin(Day, day_rechallenge_E51),
     Experiment %in% c('E62', 'E68') ~ Day,
-    Experiment == 'E74' ~ pmin(Day, day_rechallenge_E74)
+    Experiment == 'E74' ~ pmin(Day, day_rechallenge_E74), 
+    Experiment == 'E91' ~ pmin(Day, day_rechallenge_E91, na.rm = TRUE),
+    Experiment == 'E97' ~ pmin(Day, day_rechallenge_E97, na.rm = TRUE)
   )) %>% 
   select(-Day)
 
@@ -227,6 +237,8 @@ FUtimes_2 <- Weight %>%
     Experiment == 'E62' ~ NA,
     Experiment == 'E68' ~ NA,
     Experiment == 'E74' ~ pmin(Day, day_end_E74),
+    Experiment == 'E91' ~ pmin(Day, day_end_E91, na.rm = TRUE),
+    Experiment == 'E97' ~ pmin(Day, day_end_E97, na.rm = TRUE)
   )) %>% 
   select(-Day)
 
@@ -252,52 +264,16 @@ Some data QC
 ```
 
 # Survival tables and plots
-## Primary tumor, all experiments combined 
+## Primary tumor, per experiment 
 
 We check how many mice died of the tumor in each treatment setting. 
 First, we filter out all mice for which the cause of death was unknown, GVHD, etc (i.e. not the tumor) during the first challenge.
 
 ```{r}
-tableall <- knitr::kable(Survival %>%
+tableall_70 <- Survival %>%
   filter(is.na(CauseOfDeath1)) %>%
-  group_by(Target, Dose, MGAT5, Treatment) %>%
-  summarise(Total = n(), 
-            Cases = sum(Event1 == 1)) %>%
-  mutate(`%` = signif(Cases/Total, 3)*100, 
-         Case_Tot_pct = paste0(`%`, '%', ' (', Cases, '/', Total, ')')) %>%
-  select(-c(Cases, Total, `%`)) %>%
-  arrange(Target, Dose, MGAT5, Treatment)
-)
-
-tableall %>% kableExtra::save_kable(file = here("output/TablePrimary_All.pdf"))
-tableall %>% kableExtra::kable_styling()
-```
-
-We can also show this graphically
-```{r}
-Survival %>%
-  filter(is.na(CauseOfDeath1)) %>%
-  group_by(Target, Dose, MGAT5, Treatment) %>%
-  summarise(Total = n(), 
-            Cases = sum(Event1 == 1)) %>%
-  mutate(Pct = signif(Cases/Total, 3)*100) %>%
-  ggplot(aes(x = Target:Dose, y = Pct, fill = MGAT5)) +
-  geom_col(position = 'dodge') +
-  geom_text(aes(label = paste0(Cases, ' / ', Total), y = Pct + 1), size = 2.5 , 
-            vjust = 0, position = position_dodge(width = 0.9)) +
-  ylab('Percent mice died (up to rechallenge)') +
-  xlab('Target and dose (million cells)') +
-  ggtitle('Percentage of mice died', 
-          subtitle = 'labels: n died / n group total') +
-  theme_bw() +
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-```
-
-## Primary tumor, per experiment
-
-```{r}
-tableexp <- knitr::kable(Survival %>%
-  filter(is.na(CauseOfDeath1)) %>%
+  filter(!Experiment %in% c('E91', 'E97')) %>%
+  filter(Target %in% c('CD70', 'Ctrl')) %>%
   group_by(Experiment, Target, Dose, MGAT5, Treatment) %>%
   summarise(Total = n(), 
             Cases = sum(Event1 == 1)) %>%
@@ -305,142 +281,24 @@ tableexp <- knitr::kable(Survival %>%
          Case_Tot_pct = paste0(`%`, '%', ' (', Cases, '/', Total, ')')) %>%
   select(-c(Cases, Total, `%`)) %>%
   arrange(Experiment, Target, Dose, MGAT5, Treatment)
-)
 
-tableexp %>% kableExtra::save_kable(file = here("output/TablePrimary_PerExp.pdf"))
-tableexp %>% kableExtra::kable_styling()
-```
-
-We can also show this graphically
-```{r}
-Survival %>%
+tableall_70 %>% writexl::write_xlsx(here("output/SurvivalTable_CD70_Raji_Primary.xlsx"))
+tableall_70
+  
+tableall_19 <- Survival %>%
   filter(is.na(CauseOfDeath1)) %>%
-  group_by(Experiment, Target, Dose, MGAT5, Treatment) %>%
+  filter(Experiment %in% c('E91', 'E97')) %>%
+  filter(Target %in% c('CD19', 'Ctrl')) %>%
+  group_by(Experiment, Target, MGAT5, Treatment) %>%
   summarise(Total = n(), 
-            Cases = sum(Event1 == 1)) %>%
-  mutate(Pct = signif(Cases/Total, 3)*100) %>%
-  ggplot(aes(x = Target:Dose, y = Pct, fill = MGAT5)) +
-  geom_col(position = 'dodge') +
-  geom_text(aes(label = paste0(Cases, ' / ', Total), y = Pct + 1), size = 2.5 , 
-            vjust = 0, position = position_dodge(width = 0.9)) +
-  ylab('Percent mice died (up to rechallenge)') +
-  xlab('Target and dose (million cells)') +
-  ggtitle('Percentage of mice died', 
-          subtitle = 'labels: n died / n group total') +
-  facet_wrap(~Experiment) +
-  theme_bw() +
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-```
-
-## Rechallenge, all exp combined
-
-We check how many mice died of the tumor in each treatment setting. 
-First, we filter out all mice for which the cause of death was unknown, GVHD, etc (i.e. not the tumor)
-
-```{r}
-tableall2 <- knitr::kable(Survival %>%
-  filter(is.na(CauseOfDeath2)) %>%
-  filter(Experiment %in% c('E51', 'E74')) %>%
-  filter(Event1 == 0) %>%
-  group_by(Target, Dose, MGAT5, Treatment) %>%
-  summarise(Total = n(), 
-            Cases = sum(Event2 == 1)) %>%
+            Cases = sum(Event1 == 1, na.rm = TRUE)) %>%
   mutate(`%` = signif(Cases/Total, 3)*100, 
          Case_Tot_pct = paste0(`%`, '%', ' (', Cases, '/', Total, ')')) %>%
   select(-c(Cases, Total, `%`)) %>%
-  arrange(Target, Dose, MGAT5, Treatment)
-)
+  arrange(Experiment, Target, MGAT5, Treatment)
 
-tableall2 %>% kableExtra::save_kable(file = here("output/TablePrimary_All.pdf"))
-tableall2 %>% kableExtra::kable_styling()
-```
-
-We can also show this graphically
-```{r}
-Survival %>%
-  filter(is.na(CauseOfDeath2)) %>%
-  filter(Experiment %in% c('E51', 'E74')) %>%
-  filter(Event1 == 0) %>%
-  group_by(Target, Dose, MGAT5, Treatment) %>%
-  summarise(Total = n(), 
-            Cases = sum(Event2 == 1)) %>%
-  mutate(Pct = signif(Cases/Total, 3)*100) %>%
-  ggplot(aes(x = Target:Dose, y = Pct, fill = MGAT5)) +
-  geom_col(position = 'dodge') +
-  geom_text(aes(label = paste0(Cases, ' / ', Total), y = Pct + 1), size = 2.5 , 
-            vjust = 0, position = position_dodge(width = 0.9)) +
-  ylab('Percent mice died (after rechallenge)') +
-  xlab('Target and dose (million cells)') +
-  ggtitle('Percentage of mice died', 
-          subtitle = 'labels: n died / n group total') +
-  theme_bw() +
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-```
-
-# Survival analysis grouped
-
-We will do the survival analysis per target. 
-For each target, a certain dose was used as the 'standard' dose, and this is repeated in each experiment: 
-  - control (NTC): 4 million cells, all experiments 
-  - CD70: 4 million cells, all exps
-  
-We collect the data for each analysis in a separate dataframe.
-We also remove all mice that died from other causes (e.g. GVHD)
-
-```{r}
-Survival <- Survival %>%
-  mutate(Event = ifelse(is.na(Event2), Event1, Event2),
-         Time_FU = ifelse(is.na(Time_FU_2), Time_FU_1, Time_FU_2),
-         cMGAT5 = as.character(MGAT5))
-
-CD70 <- Survival %>%
-  filter((Target == 'CD70' & Dose == '4') | 
-           (Target == 'Ctrl' & Dose == '4')) %>%
-  filter(Event %in% c('0', '1'))
-
-surv_CD70 <- Surv(CD70$Time_FU, CD70$Event)
-
-simple_palette_CD70= c('grey', 
-                       rgb(255,0,0, maxColorValue = 255),
-                       rgb(255,128,128, maxColorValue = 255))
-stratify_palette_CD70 = c('grey', 
-                          rgb(255,128,128, maxColorValue = 255),
-                          rgb(255,0,0, maxColorValue = 255))
-
-```
-
-## CD70
-
-```{r}
-sCD70 <- survfit2(surv_CD70 ~ MGAT5, data = CD70)
-CD70_combi <- ggsurvplot(sCD70, data = CD70, palette = simple_palette_CD70, 
-                         legend.labs = c('Control', 'MGAT5 WT', 'MGAT5 KO'),
-                         xlim = c(0,180))
-CD70_perexp <- ggsurvplot_facet(sCD70, facet.by = 'Experiment', data = CD70, 
-                                palette = stratify_palette_CD70, 
-                                xlim = c(0,180))
-
-CD70_combi$plot <- CD70_combi$plot +
-  geom_vline(xintercept = 136, linetype = 'dashed', color = 'darkgrey') +
-  geom_text(aes(x = 152, y = 0.01, label = 'Rechallenge')) 
-
-CD70_perexp <- CD70_perexp +
-  geom_vline(xintercept = 136, linetype = 'dashed', color = 'darkgrey') +
-  geom_text(aes(x = 162, y = 0.03, label = 'Rechallenge'), size = 3)
-  
-ggsave(here('output/CD70_combi.pdf'), CD70_combi$plot, 
-       device = 'pdf', width  = 8, height = 5)
-
-ggsave(here('output/CD70_perexp.pdf'), CD70_perexp, 
-       device = 'pdf', width = 8, height = 5)
-
-CD70_combi
-CD70_perexp
-```
-
-```{r}
-survdiff(Surv(Time_FU_1, Event1) ~ MGAT5, data = CD70 %>% filter(MGAT5 != 'Ctrl'))
-survdiff(Surv(Time_FU_2, Event2) ~ MGAT5, data = CD70 %>% filter(MGAT5 != 'Ctrl'))
+tableall_19 %>% writexl::write_xlsx(here("output/SurvivalTable_CD19_Raji_Primary.xlsx"))
+tableall_19
 ```
 
 # Survival analysis only primary and per donor
@@ -466,12 +324,32 @@ CD70 <- Survival %>%
 
 surv_CD70 <- Surv(CD70$Time_FU, CD70$Event)
 
-simple_palette_CD70= c('grey', 
-                       rgb(255,0,0, maxColorValue = 255),
-                       rgb(255,128,128, maxColorValue = 255))
-stratify_palette_CD70 = c('grey', 
-                          rgb(255,128,128, maxColorValue = 255),
-                          rgb(255,0,0, maxColorValue = 255))
+simple_palette_CD70= c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(251,79,6, maxColorValue = 255),
+    rgb(14,111,124, maxColorValue = 255)
+    )
+stratify_palette_CD70 = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))
+
+CD19 <- Survival %>%
+  filter((Target == 'CD19') | 
+           (Target == 'Ctrl' & Experiment %in% c('E91', 'E97'))) %>%
+  filter(Event %in% c('0', '1'))
+
+surv_CD19 <- Surv(CD19$Time_FU, CD19$Event)
+
+simple_palette_CD19= c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(251,79,6, maxColorValue = 255),
+    rgb(14,111,124, maxColorValue = 255)
+    )
+stratify_palette_CD19 = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))
 
 ```
 
@@ -490,11 +368,11 @@ CD70_combi$plot <- CD70_combi$plot
 
 CD70_perexp <- CD70_perexp 
   
-ggsave(here('output/CD70_combi_primaryOnly.pdf'), CD70_combi$plot, 
-       device = 'pdf', width  = 8, height = 5)
+ggsave(here('output/SurvivalPlot_CD70_Raji_allExp_primary.pdf'), CD70_combi$plot, 
+       device = 'pdf', width  = 8, height = 5, )
 
-ggsave(here('output/CD70_perexp_primaryOnly.pdf'), CD70_perexp, 
-       device = 'pdf', width = 8, height = 5)
+ggsave(here('output/SurvivalPlot_CD70_Raji_perExp_primary.pdf'), CD70_perexp, 
+       device = 'pdf', width = 8, height = 5, units = mm)
 
 CD70_combi
 CD70_perexp
@@ -506,6 +384,41 @@ CD70 %>%
   group_by(Experiment) %>%
   summarise(pval = survdiff(Surv(Time_FU_1, Event1) ~ MGAT5)$pval %>% round(.,3)) %>%
   mutate(Model = 'Raji, anti-CD70, Survival for primary tumor') %>%
+  select(Model, everything())
+```
+## CD19
+
+```{r}
+sCD19 <- survfit2(surv_CD19 ~ MGAT5, data = CD19)
+CD19_combi <- ggsurvplot(sCD19, data = CD19, palette = simple_palette_CD19, 
+                         legend.labs = c('Control', 'MGAT5 WT', 'MGAT5 KO'))
+CD19_perexp <- ggsurvplot_facet(sCD19, facet.by = 'Experiment', data = CD19, 
+                                palette = stratify_palette_CD19)
+
+CD19_combi$plot <- CD19_combi$plot 
+
+CD19_perexp <- CD19_perexp +
+  xlab('') +
+  ylab('') +
+  theme(legend.position = 'none',
+        strip.text = element_blank())
+
+ggsave(here('output/SurvivalPlot_CD19_Raji_allExp_primary.pdf'), CD19_combi$plot, 
+       device = 'pdf', width  = 8, height = 5)
+
+ggsave(here('output/SurvivalPlot_CD19_Raji_perExp_primary.pdf'), CD19_perexp, 
+       device = 'pdf', width = 86*2, height = 25*2, units = 'mm')
+
+CD19_combi
+CD19_perexp
+```
+
+```{r}
+CD19 %>%
+  filter(MGAT5 != 'Ctrl') %>%
+  group_by(Experiment) %>%
+  summarise(pval = survdiff(Surv(Time_FU_1, Event1) ~ MGAT5)$pval %>% round(.,3)) %>%
+  mutate(Model = 'Raji, anti-CD19, Survival for primary tumor') %>%
   select(Model, everything())
 ```
 

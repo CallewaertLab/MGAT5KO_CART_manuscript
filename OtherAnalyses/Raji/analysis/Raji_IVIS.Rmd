@@ -1,0 +1,281 @@
+---
+title: "Raji IVIS"
+author: "L. Meuris"
+date: "2025-12-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+here::i_am("analysis/Raji_IVIS.Rmd")
+library(here)
+library(readxl)
+library(tidyverse)
+library(scales)
+
+power_trans <- function(power){
+   trans_new("power",
+             transform = function(y){
+                if(power != 0){
+                   yt <- sign(y) * abs(y)^(power)
+                } else {
+                   yt = y
+                }
+                return(yt)
+             },
+             inverse = function(yt){
+                if(power != 0){
+                   y <- yt^(1/(power))
+                } else {
+                   y <- yt
+                   
+                }
+                return(y)
+             },
+             domain = c(-Inf, Inf)
+             )
+}
+```
+
+# Description of experiments
+
+Purpose of the experiment is to look at the effect of MGAT5 engineering in CART-cells in a mouse tumor model. The model uses Raji cells, which create blood tumors of the Burkitt's lymphoma type. These cells are CD19, CD20 and CD70 positive.  
+
+The experiment has the following timeline:
+
+  - day 0: injection of 500 000 Raji cells IV
+  - around day 6: IVIS baseline measurement
+  - around day 7: treatment (CAR T injection ivin different doses and controls)
+  - around day 133: rechallenge in some targets
+  
+The mice are followed up via body weight measurements and IVIS data, which measures luminescence of the Raji cells in the mice. IVIS measurements are taken at set days (every 3 or 4 days) and mice weights are recorded every 2 days. There are 4 experiments, each with 5 mice per group. 
+
+Experiment 51:
+
+  - PBS: no cells given
+  - NTC: 4 million cells donor T-cells, no CAR T cells
+  - CD70 CART WT 4 million cells
+  - CD70 CART MGAT5 4 million cells
+  - CD70 CART WT 2 million cells
+  - CD70 CART MGAT5 2 million cells
+  - CD20 CART WT 1 million cells
+  - CD20 CART MGAT5 1 million cells
+  - CD20 CART WT 0.5 million cells
+  - CD20 CART MGAT5 0.5 million cells
+  
+Experiment 62 and 68:
+
+  - NTC: 4 million cells donor T-cells, no CAR T cells
+  - CD70 CART WT 4 million cells
+  - CD70 CART MGAT5 4 million cells
+  - CD20 CART WT 0.5 million cells
+  - CD20 CART MGAT5 0.5 million cells
+  - CD19 CART WT 2 million cells
+  - CD19 CART MGAT5 2 million cells
+  
+Experiment 74: used 6 mice per group, and no CD19 CART cells:
+
+  - NTC: 4 million cells donor T-cells, no CAR T cells
+  - CD70 CART WT 4 million cells
+  - CD70 CART MGAT5 4 million cells
+  - CD20 CART WT 0.5 million cells
+  - CD20 CART MGAT5 0.5 million cells
+  
+Experiment 91 and 97
+
+  - NTC 
+  - CD19 CART WT
+  - CD19 CART MGAT5
+  
+Summarizing we can say that: 
+
+  1) there are 3 CART targets: CD19, CD20, CD70
+  2) different amounts of CART cells have been injected; 0.5, 2 or 4 million
+  3) CART cells were either engineered or not to have MGAT5 knocked out
+  
+There was a rechallenge part to experiments 51 and 74, but not to 62 and 68. No data yet on exp 91 or 97, experiments still running. A rechallenge means that tumor cells were administered again after a set period.
+We also note the end-day of the experiments, as we need this for calculations of the survival times.
+Experiment 91 and 97 are still running, so no end days yet there either. 
+
+```{r}
+day_rechallenge_E51 <- 133
+day_rechallenge_E62 <- NA
+day_rechallenge_E68 <- NA
+day_rechallenge_E74 <- 139
+day_rechallenge_E91 <- NA
+day_rechallenge_E97 <- NA
+
+day_end_E51 <- 215
+day_end_E62 <- 83
+day_end_E68 <- 88
+day_end_E74 <- 202
+day_end_E91 <- NA
+day_end_E97 <- NA
+```
+
+# Data
+
+First, we load all the data for Exp 51, 62, 68, 74, 91, 97
+```{r}
+sheets <- excel_sheets(here('data/data_cleaned.xlsx'))
+datalist <- map(sheets, read_xlsx, path = here('data/data_cleaned.xlsx'))
+names(datalist) <- sheets
+```
+
+## Metadata 
+Get the metadata
+```{r}
+metadata <- datalist$Metadata
+```
+
+## IVIS data
+Get the IVIS data for each experiment,
+Put in long format,
+Combine data from 4 experiments into one large dataframe,
+Remove lines with missing weight data
+Select relevant columns and sort
+
+```{r}
+IVIS <- datalist[str_detect(names(datalist), 'IVIS')] %>% # select only IVIS data
+  bind_rows(.id = 'Experiment') %>%
+  mutate(Experiment = str_remove(Experiment, 'IVIS'),
+         Mouse = as.numeric(Mouse)) %>%
+  filter(!is.na(IVIS_Counts)) %>%
+  filter(IVIS_Exposure == 3) %>%
+  select(Experiment, Mouse, Day, IVIS_Counts) %>%
+  arrange(Experiment, Mouse, Day)
+IVIS <- left_join(IVIS, metadata)
+```
+
+Clean up
+```{r}
+rm(metadata, datalist, sheets)
+```
+
+# Data cleaning
+
+Parse variables to correct type
+Remove some data that are superfluous or problematic: 
+
+EXP51:
+  - Mouse 21 in exp 51 was a sentinel mouse
+
+EXP62:
+  - Mouse 26 and 27 in exp 62 were spare, were not used
+  - Mouse 18, 23, 24, 25, 28 in exp 62 died from heat of the lamps so cannot be used in analysis
+
+EXP68:
+  - Mice 1, 22 were not in the experiment and 38-43 were backup in exp 68.
+  
+EXP74: 
+  - Mouse 22: euthanized due to unsure Raji injection
+  - Mouse 30: euthanized by accident
+  - Mouse 29: excluded due to unsure Raji injection
+  - Mouse 46 and 47: controls for Raji effectiveness at secondary injection
+
+
+```{r}
+IVIS <- IVIS %>%
+  filter(!(Mouse %in% c(18,23,24,25,26,27,28) & Experiment == 'E62')) %>%
+  filter(!(Mouse == 21 & Experiment == 'E51')) %>%
+  filter(!(Mouse %in% c(1,22,38,39,40,41,42,43) & Experiment == 'E68')) %>%
+  filter(!(Mouse %in% c(22,29,30,46,47) & Experiment == 'E74')) %>%
+  arrange(Experiment, Mouse, Day) %>%
+  mutate(Experiment = factor(Experiment), 
+         ID = fct_inorder(paste0(Experiment, 'M', Mouse)), 
+         Treatment = factor(Treatment), 
+         Target = factor(Target, levels =c('Ctrl', 'CD19', 'CD20', 'CD70')), 
+         MGAT5 = factor(MGAT5, levels = c('Ctrl', 'MGAT5WT', 'MGAT5KO')),
+         Dose = factor(Dose, levels = c('0','1','0.5','2','4'))) %>%
+  select(Experiment, Mouse, ID, everything())
+```
+
+
+Write datasheets to xlsx files for later reference
+```{r}
+#data$IVIS %>% writexl::write_xlsx(here('output/IVIS.xlsx'))
+```
+
+Some data QC
+```{r}
+#data$IVIS %>% map(~any(is.na(.)))
+```
+
+# Plot IVIS data 
+
+IVIS traces for individual mice per experiment
+
+## CD70
+
+```{r}
+IVIS_70 <- IVIS %>%
+  filter(!Experiment %in% c('E91', 'E97')) %>%
+  filter((Target == 'CD70' & Dose == '4') | Target ==  'Ctrl') %>%
+  filter(ifelse(Experiment == 'E51', Day < day_rechallenge_E51, Day < day_rechallenge_E74)) %>%
+  droplevels %>%
+  ggplot(aes(x = Day, y = IVIS_Counts, Group = ID, color = MGAT5)) +
+  geom_line(alpha = 0.8) +
+  facet_grid(Experiment~.)+
+  theme_bw() +
+  scale_y_log10() +
+  scale_color_manual(values = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  ylab('IVIS counts') +
+  ggtitle('CD70 CART cells')
+
+IVIS_70
+
+ggsave(here('output/IVISPlot_CD70_Raji_perExp.pdf'), IVIS_70, 
+       device = 'pdf', width  = 8, height = 5)
+```
+
+## CD19
+
+```{r}
+IVIS_19 <- IVIS %>%
+  filter(Experiment == 'E91' | Experiment == 'E97') %>%
+  droplevels %>%
+  ggplot(aes(x = Day, y = IVIS_Counts, Group = ID, color = MGAT5)) +
+  geom_line(alpha = 0.8) +
+  facet_grid(Experiment~.)+
+  theme_bw() +
+  scale_y_log10() +
+  scale_color_manual(values = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  ylab('IVIS counts') +
+  ggtitle('CD19 CART cells')
+
+IVIS_19
+
+ggsave(here('output/IVISPlot_CD19_Raji_perExp.pdf'), IVIS_19, 
+       device = 'pdf', width  = 8, height = 5)
+```
+
+Plot per mouse to check for errors
+
+```{r}
+IVIS_19_permouse <- IVIS %>%
+  filter(Experiment == 'E97') %>%
+  droplevels %>%
+  ggplot(aes(x = Day, y = IVIS_Counts, Group = ID, color = MGAT5)) +
+  geom_line(alpha = 0.8) +
+  facet_wrap(~fct_reorder(ID, as.numeric(Treatment))) +
+  theme_bw() +
+  scale_y_log10() +
+  scale_color_manual(values = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  ylab('IVIS counts') +
+  ggtitle('CD19 CART cells')
+
+IVIS_19_permouse
+
+ggsave(here('output/IVISPlot_CD19_Raji_perMouse.pdf'), IVIS_19_permouse, 
+       device = 'pdf', width  = 10, height = 10)
+```
+

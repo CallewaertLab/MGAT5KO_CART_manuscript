@@ -1,5 +1,5 @@
 ---
-title: ""
+title: "SKOV3 cell counts"
 author: "Leander Meuris"
 date: "`r Sys.Date()`"
 output:
@@ -7,11 +7,10 @@ output:
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 here::i_am("analysis/SKOV3_cellcounts.Rmd")
 library(here)
 library(readxl)
-library(dplyr)
 library(tidyr)
 library(broom)
 library(ggplot2)
@@ -19,7 +18,17 @@ library(ggbeeswarm)
 library(modelr)
 library(stringr)
 library(glmmTMB)
+library(emmeans)
+library(dplyr) # load after glmmTMB due to conflicts
 options(knitr.kable.NA = "")
+
+pseudo_log <-  function(x, sigma = 1, base = 10) {
+  asinh(x / (2 * sigma)) / log(base)
+}
+
+inv_pseudo_log <- function(x, sigma = 1, base = 10) {
+  2 * sigma * sinh(x * log(base))
+}
 ```
 
 # Data
@@ -27,16 +36,13 @@ options(knitr.kable.NA = "")
 The data are from a flow cytometry experiment which analyzed the number of CART cells in the blood or spleen of mice carrying a tumor and treated with different versions of CAR T-cells or controls. The following variables are in the dataset:
 
   - Experiment: from which experiment are the data (Exp 30, 32, 43)
-  - Timepoint: from which moment in the experiment? We have "Early", "Mid" and "Late", corresponding to around day 35, 85 and 120. 
+  - Timepoint: from which moment in the experiment? We have "Early", "Mid" and "Late", corresponding to day 34, 80/88/85 (Exp 30, 32, 43) and 116/123/123 (Exp 30, 32 ,43). 
   - Treatment: mice received no CAR T-cells (PBS, NTC, None), CAR T-cells but no MGAT5 engineering (CD70 nanoCAR-neg and CD70 nanoCAR-WT) or CAR T-cells which were MGAT5 KO (CD70 nanoCAR-MGAT5 KO)
   - CellCount: the number of cells found in a spleen or in 1 ul blood. 
   - Location: whether spleen or blood was analyzed. 
 
 ```{r}
-data <- read_xlsx(here('data/FACSdata_clean.xlsx'))
-
-data <- data %>%
-  filter(!is.na(CellCount))
+data <- read_xlsx(here('data/FACSdata_clean_new.xlsx'))
 ```
 
 Make a group variable, indicating no CAR, CAR or CAR with MGAT5 KO.
@@ -44,20 +50,41 @@ Then make 6 subsets of the data: Spleen and Blood, each early, mid, late.
 
 ```{r}
 data <- data %>%
-  mutate(
-    Group = factor(case_when(
-      Treatment %in% c('PBS', 'NTC', 'None') ~ 'Control',
-      Treatment %in% c('CD70 nanoCAR-neg', 'CD70 nanoCAR-WT') ~ 'CAR',
-      Treatment == 'CD70 nanoCAR-MGAT5 KO' ~ 'MGAT5KO_CAR'), 
-      levels = c('Control', 'CAR', 'MGAT5KO_CAR'), 
-      labels = c('WT T-cells or None', 'CD70 nanoCAR', 'CD70 nanoCAR - MGAT5 KO')),
-    TimePoint = factor(TimePoint, levels = c('Early', 'Mid', 'Late'), 
-                       labels = c('Early', 'Mid', 'Endpoint')),
-    Experiment = factor(
-      Experiment,
-      levels = c('Exp30', 'Exp32', 'Exp43'),
-      labels = c('Experiment A', 'Experiment B', 'Experiment C')),
-    Location = factor(Location))
+  filter(!is.na(CellCount))
+
+Early_TP <- c(34)
+Mid_TP <- c(80, 88, 85)
+End_TP <- c(116, 123)
+
+data <- data %>%
+  mutate(Experiment = paste0('Exp', Experiment),
+         Day_Meas_Early = 34,
+         Day_Meas_Mid = case_when(
+           Experiment == 'Exp30' ~ 80,
+           Experiment == 'Exp32' ~ 88,
+           Experiment == 'Exp43' ~ 85),
+         Day_Meas_End = case_when(
+           Experiment == 'Exp30' ~ 116,
+           Experiment %in% c('Exp32', 'Exp43') ~ 123),
+         TimePoint = case_when(
+           Day %in% Early_TP ~ 'Early',
+           Day %in% Mid_TP ~ 'Mid',
+           Day %in% End_TP ~ 'Late'),
+         Group = factor(case_when(
+           Treatment %in% c('PBS', 'NTC', 'None') ~ 'Control',
+           Treatment %in% c('CD70 nanoCAR-neg', 'CD70 nanoCAR-WT') ~ 'CAR',
+           Treatment %in% c('CD70 nanoCAR-MGAT5 KO','CD70 nanoCAR-MGAT5KO') ~ 'MGAT5KO_CAR'),
+           levels = c('Control', 'CAR', 'MGAT5KO_CAR'),
+           labels = c('WT T-cells or None', 'CD70 nanoCAR', 'CD70 nanoCAR - MGAT5 KO')),
+         TimePoint = factor(TimePoint, 
+                            levels = c('Early', 'Mid', 'Late'),
+                            labels = c('Early', 'Mid', 'Endpoint')),
+         ID = paste0(Experiment,'M', Mouse),
+         Experiment = factor(Experiment,
+                             levels = c('Exp30', 'Exp32', 'Exp43'),
+                             labels = c('Experiment A', 'Experiment B', 'Experiment C')),
+         Location = factor(Location),
+         plCC = pseudo_log(CellCount))
 ```
 
 We note that cell counts can be lower than 1 if we look in blood. 
@@ -70,10 +97,127 @@ data <- data %>%
   mutate(CellCount = ifelse(Location == 'Blood',
                             (1000*CellCount) %>% round(., 0),
                             CellCount %>% round(., 0)))
+```
+
+We also want to add the info on which mice are tumor free or have a tumor at the different moments of measurement. 
+
+```{r}
+Ctrl <- read_xlsx(here('data/Survival.xlsx')) %>%
+  mutate(ID = paste0('Exp',Experiment,'M',Mouse),
+         Experiment = factor(paste0('Exp', Experiment),
+                             levels = c('Exp30', 'Exp32', 'Exp43'),
+                             labels = c('Experiment A', 'Experiment B', 'Experiment C')))
+
+data <- left_join(data, Ctrl)
+```
+
+We first determine the last day of any measurement for each mouse
+
+```{r}
+data <- left_join(data, data %>%
+                    group_by(ID) %>%
+                    summarise(max_time = max(pmax(
+                      Day, TimeFUP_FullCtrl, TimeFUP_PartialCtrl, 
+                      TimeFUS_FullCtrl, TimeFUS_PartialCtrl, 
+                      DayRelapse, Daylastmeasurement,na.rm = T), 
+                      na.rm = T), .groups = 'drop'))
+```
+
+We define classes of outcome by the mid or end timepoint. 
+  - mouse dead before
+  - tumor growing
+  - tumor stasis/shrinking
+  - tumor free
+
+First for the mid timepoint
+
+```{r}
+data <- data %>%
+  mutate(Status_Mid = case_when(
+    # Control mice and special case Exp A
+    is.na(StatusPrimary) ~ NA,
+    Experiment == 'Experiment A' &
+      StatusPrimary == 'No control' ~ 'Tumor',
+    Experiment == 'Experiment A' &
+      StatusPrimary == 'Control, no relapse' ~ 'No tumor',
+    # Mouse died before measurement
+    Day_Meas_Mid > max_time &
+      Experiment %in% c('Experiment B', 'Experiment C') ~ 'Dead',
+    # Mouse never controlled tumor
+    Day_Meas_Mid <= max_time &
+      StatusPrimary == 'No control' ~ 'Tumor',
+    # Mouse partially controlled tumor, then relapse
+    Day_Meas_Mid <= max_time &
+      StatusPrimary == 'Partial control, relapse' &
+      Day_Meas_Mid < TimeFUP_PartialCtrl ~ 'Tumor',
+    Day_Meas_Mid <= max_time &
+      StatusPrimary == 'Partial control, relapse' &
+      between(Day_Meas_Mid, TimeFUP_PartialCtrl, DayRelapse) ~ 'Tumor',
+    Day_Meas_Mid <= max_time &
+      StatusPrimary == 'Partial control, relapse' &
+      DayRelapse < Day_Meas_Mid ~ 'Tumor',
+    # Mouse fully controlled tumor, then relapse
+    Day_Meas_Mid <= max_time &
+      StatusPrimary == 'Control, relapse' &
+      Day_Meas_Mid < TimeFUP_FullCtrl ~ 'Tumor',
+    Day_Meas_Mid <= max_time &
+      StatusPrimary == 'Control, relapse' &
+      between(Day_Meas_Mid, TimeFUP_FullCtrl, DayRelapse) ~ 'No tumor',
+    Day_Meas_Mid <= max_time &
+      StatusPrimary == 'Control, relapse' &
+      DayRelapse < Day_Meas_Mid ~ 'Tumor',
+    # Mouse fully controlled tumor, never relapsed
+    Day_Meas_Mid <= max_time &
+      StatusPrimary == 'Control, no relapse' &
+      Day_Meas_Mid < TimeFUP_PartialCtrl ~ 'Tumor',
+    Day_Meas_Mid <= max_time &
+      StatusPrimary == 'Control, no relapse' &
+      Day_Meas_Mid >= TimeFUP_PartialCtrl ~ 'No tumor',
+    ))
 
 data <- data %>%
-  mutate(CellCountPlotting = CellCount)
+  mutate(Status_Mid = factor(Status_Mid, 
+                             levels = c('No tumor', 'Tumor', 'Dead')))
 ```
+
+Then for the end timepoint
+
+```{r}
+data <- data %>%
+  mutate(Status_End = case_when(
+    Experiment == 'Experiment A' &
+      max_time == 34 ~ 'No tumor',
+    # Mouse died before measurement
+    Day_Meas_End > max_time ~ 'Dead',
+    # Exp A, all mice cleared the tumor
+    Day_Meas_End <= max_time & 
+      Experiment == 'Experiment A' ~ 'No tumor',
+    # Mouse never or only partially controlled tumor
+    Day_Meas_End <= max_time &
+      StatusSecondary %in% c('No control', 'Partial control') ~ 'Tumor',
+    # Mouse fully controlled the tumor
+    Day_Meas_End <= max_time &
+      StatusSecondary == 'Control' ~ 'No tumor',
+    # Mouse never developed a tumor
+    Day_Meas_End <= max_time &
+      StatusSecondary == 'No tumor' ~ 'No tumor'
+    ))
+
+data <- data %>%
+  mutate(Status_End = factor(Status_End, 
+                             levels = c('No tumor', 'Tumor', 'Dead')))
+```
+
+Disease course
+
+```{r}
+data <- data %>%
+  mutate(T1_to_T3 = paste0('Tumor - ', Status_Mid, ' - ', Status_End),
+         T1_to_T2 = paste0('Tumor - ', Status_Mid),
+         T2_to_T3 = paste0(Status_Mid, ' - ', Status_End))
+
+```
+
 
 # Exploratory data analysis
 
@@ -84,9 +228,8 @@ We also use a pseudo-log-scale y axis to better see differences.
 ```{r}
 BloodBoxplots <- data %>%
   filter(Location == 'Blood') %>%
-  ggplot(aes(x = Group, y = CellCountPlotting, color = Group)) +
+  ggplot(aes(x = Group, y = CellCount, color = Group)) +
   geom_boxplot(outlier.shape = NA) +
-  geom_line(aes(group = ID)) +
   geom_jitter(alpha = 0.4, width = 0.2) +
   facet_grid(Experiment~TimePoint) +
   scale_y_continuous(trans = 'pseudo_log', 
@@ -101,7 +244,7 @@ BloodBoxplots <- data %>%
 
 SpleenBoxplots <- data %>%
   filter(Location == 'Spleen') %>%
-  ggplot(aes(x = Group, y = CellCountPlotting, color = Group)) +
+  ggplot(aes(x = Group, y = CellCount, color = Group)) +
   geom_boxplot(outlier.shape = NA) +
   geom_jitter(alpha = 0.4, width = 0.2) +
   facet_grid(Experiment~TimePoint) +
@@ -115,37 +258,23 @@ SpleenBoxplots <- data %>%
     rgb(251,79,6, maxColorValue = 255))) +
   labs(y = 'Cells per Spleen')
 
-ggsave(here("output/BloodBoxplots.pdf"), BloodBoxplots,
-       device = "pdf", height = 8, width = 8, dpi=600)
-ggsave(here("output/SpleenBoxplots.pdf"), SpleenBoxplots,
-       device = "pdf", height = 8, width = 8, dpi=600)
+#ggsave(here("output/BloodBoxplots.pdf"), BloodBoxplots,
+#       device = "pdf", height = 8, width = 8, dpi=600)
+#ggsave(here("output/SpleenBoxplots.pdf"), SpleenBoxplots,
+#       device = "pdf", height = 8, width = 8, dpi=600)
 
 BloodBoxplots
 SpleenBoxplots
 
 ```
 
-```{r}
-data %>%
-  filter(Location == 'Blood') %>%
-  ggplot(aes(x = Experiment, y = CellCountPlotting, fill = Group)) +
-  geom_boxplot(aes(color = Group)) +
-  scale_y_continuous(trans = 'pseudo_log',
-                     breaks = c(0,5,25,150,1000,10000,100000)) +
-  facet_wrap(~TimePoint) +
-  scale_x_discrete(guide = guide_axis(angle = 90)) +
-  theme_bw() +
-  scale_fill_manual(values = c(
-    rgb(44,20,83, maxColorValue = 255), 
-    rgb(14,111,124, maxColorValue = 255),
-    rgb(251,79,6, maxColorValue = 255))) +
-  scale_color_manual(values = c('grey20','grey20', 'grey20')) +
-  labs(y = 'Cells per ml of blood')
-```
+# Models comparing MGAT5 vs WT per timepoint 
 
-# Models comparing MGAT5 vs WT per timepoint
+## Model
 
-Prepare data
+Summary: 
+  - Model separately per experiment and per timepoint
+  - Don't take into account which mice cleared the tumor
 
 ```{r}
 modeldata <- data %>%
@@ -169,6 +298,8 @@ modeldata <- modeldata %>%
                                ncol = length(Coefnames),
                                dimnames = list('MGAT5 vs nanoCAR WT',
                                                Coefnames))),
+         data = list(data %>% mutate(
+           pred = predict(mod, type = 'response'))),
          Table = list(left_join(
            multcomp::glht(mod, linfct = ContMat) %>% summary %>% tidy,
            multcomp::glht(mod, linfct = ContMat) %>% confint %>% tidy) %>%
@@ -184,100 +315,243 @@ knitr::kable(modeldata %>%
                arrange(TimePoint, Experiment))
 ```
 
-# Data summary
-
-We plot the summary data per organ and time phase. 
+## Data plots
 
 ```{r}
-BloodSummaryBoxplots <- data %>%
+modeldata$ID <- 1:nrow(modeldata)
+
+data_aug <- bind_rows(modeldata$data, .id = "ID") %>%
+  mutate(ID = as.numeric(ID))
+
+data_aug <- left_join(data_aug, modeldata %>% select(ID, Experiment, Location, TimePoint))
+
+BloodPlots <- data_aug %>%
   filter(Location == 'Blood') %>%
+  filter(Group != 'WT T-cells or None') %>%
   ggplot(aes(x = Group, y = CellCount, color = Group)) +
-  geom_boxplot(outlier.shape = NA) +
-  geom_jitter(alpha = 0.5, width = 0.2, aes(shape = Experiment)) +
-  facet_wrap(~TimePoint) +
-  scale_y_continuous(trans = 'sqrt', breaks = c(0, 1000, 5000, 10000, 20000, 40000, 60000)) +
-  theme_bw() +
+  geom_errorbar(aes(y = pred, color = Group, ymin = pred, ymax = pred)) +
+  geom_jitter(alpha = 0.4, width = 0.2) +
+  facet_grid(Experiment~TimePoint) +
+  scale_y_continuous(trans = 'pseudo_log', 
+                     breaks = c(0,10,100,1000,10000,100000)) +
   scale_x_discrete(guide = guide_axis(angle = 90)) +
+  theme_bw() +
   scale_colour_manual(values = c(
-    rgb(44,20,83, maxColorValue = 255), 
+    #rgb(44,20,83, maxColorValue = 255), 
     rgb(14,111,124, maxColorValue = 255),
     rgb(251,79,6, maxColorValue = 255))) +
   labs(y = 'Cells per ml of blood')
 
-SpleenSummaryBoxplots <- data %>%
-  filter(Location == 'Spleen') %>%
-  ggplot(aes(x = Group, y = CellCount, color = Group)) +
-  geom_boxplot(outlier.shape = NA) +
-  geom_jitter(alpha = 0.6, width = 0.1, aes(shape = Experiment)) +
-  facet_grid(~TimePoint) +
-  scale_y_continuous(trans = 'sqrt', breaks = c(0, 10000, 50000, 100000, 200000, 400000, 600000)) +
-  theme_bw() +
-  scale_colour_manual(values = c(
-    rgb(44,20,83, maxColorValue = 255), 
-    rgb(14,111,124, maxColorValue = 255),
-    rgb(251,79,6, maxColorValue = 255))) +
-  scale_x_discrete(guide = guide_axis(angle = 90)) +
-  labs(y = 'Cells per Spleen')
+BloodPlots
 
-ggsave(here("output/BloodSummaryBoxplots.pdf"), BloodSummaryBoxplots,
-       device = "pdf", height = 5, width = 12, dpi=600)
-ggsave(here("output/SpleenSummaryBoxplots.pdf"), SpleenSummaryBoxplots,
-       device = "pdf", height = 5, width = 12, dpi=600)
+ggsave(here("output/BloodPlots.pdf"), BloodPlots,
+       device = "pdf", height = 8, width = 8, dpi=600)
 ```
 
 ```{r}
-data %>%
-  filter(Location == 'Blood') %>%
-  ggplot(aes(x = Group, y = CellCountPlotting, color = Group)) +
-  geom_boxplot(outlier.shape = NA) +
-  geom_jitter(alpha = 0.5, width = 0.2, aes(shape = Experiment)) +
-  facet_wrap(~TimePoint) +
-  scale_y_log10() +
-  theme_bw() +
+SpleenPlots <- data_aug %>%
+  filter(Location == 'Spleen') %>%
+  filter(Group != 'WT T-cells or None') %>%
+  ggplot(aes(x = Group, y = CellCount, color = Group)) +
+  geom_errorbar(aes(y = pred, color = Group, ymin = pred, ymax = pred)) +
+  geom_jitter(alpha = 0.4, width = 0.2) +
+  facet_grid(Experiment~TimePoint) +
+  scale_y_continuous(trans = 'pseudo_log', 
+                     breaks = c(0,10,100,1000,10000,100000)) +
   scale_x_discrete(guide = guide_axis(angle = 90)) +
+  theme_bw() +
   scale_colour_manual(values = c(
-    rgb(44,20,83, maxColorValue = 255), 
+    #rgb(44,20,83, maxColorValue = 255), 
     rgb(14,111,124, maxColorValue = 255),
     rgb(251,79,6, maxColorValue = 255))) +
   labs(y = 'Cells per ml of blood')
 
-data %>%
-  filter(Location == 'Spleen') %>%
-  droplevels %>%
-  ggplot(aes(x = Group, y = CellCountPlotting, color = Group)) +
-  geom_boxplot(outlier.shape = NA) +
-  geom_jitter(alpha = 0.5, width = 0.2, aes(shape = Experiment)) +
-  facet_wrap(~TimePoint) +
-  scale_y_log10() +
-  theme_bw() +
-  scale_x_discrete(guide = guide_axis(angle = 90)) +
-  scale_colour_manual(values = c(
-    rgb(44,20,83, maxColorValue = 255), 
-    rgb(14,111,124, maxColorValue = 255),
-    rgb(251,79,6, maxColorValue = 255))) +
-  labs(y = 'Cells per ml of blood')
+SpleenPlots
+
+ggsave(here("output/SpleenPlots.pdf"), SpleenPlots,
+       device = "pdf", height = 8, width = 6, dpi=600)
 ```
 
-# Materials and Methods
+Plots are on the log scale, with observed data as dots and model predictions as lines. These lines are the predicted mean of each group. Plotted on the log scale, these tend to look 'too high', especially with right skew data, but are actually correct log transformed means. On the original scale they would look like correct means. 
+
+## Methods
 
 To analyse the FACS-based cell-count data of three separate experiments, we ran separate models for each combination of time-point (Early, Mid, Late/Endpoint), source (Blood or Spleen) and donor (= experiment). We don't have data available for all combinations of factors: for Blood, data is lacking on non-engineered cells for the Mid timepoint in experiment A and C. For Spleen we don't have any data for the Mid timepoint and we only have data from experiment A for the Early timepoint. Consequently, no models were run for these settings.
 
 We ran quasipoisson models in R [ref], using the glm function with Cell Counts as the outcome variable and Group as predictor. An omnibus test for the main effects was performed using the Anova function (car package [ref]) with type 2 sums of squares. Next, we tested the specific contrast of MGAT5 engineered anti-CD70 nanoCAR T cells versus WT nanoCAR T cells. The contrast estimates, p-values and 95% confidence intervals were calculated using the multcomp package [ref].
 
-For reference; settings for which no data are available: 
+# Population contraction/expansion: TP1 -> TP2 and MGAT5 effect from one model
+
+To answer this, we will look separately at the mice that have cleared the tumor vs. those that have not. 
+We made a new variable for this (Status_Mid), based on the survival analysis. 
+This variable captures whether a mouse has died, survived and carries a tumor at TimePoint 2 or survived and does not carry a tumor by timepoint 2.
+
+A complication is that in experiment A the mice for which blood cell counts are available at the early time point were all sacrificed to count splenocytes. So in experiment A we do not have measurements on multiple time points for the same mice. The setup of experiment B and C was such that we do have multiple time points on the same mice (i.e. correlated data). 
+
+## Model
+
+Prepare data for modeling
+
 ```{r}
-knitr::kable(data %>%
-  group_by(Location, TimePoint, Experiment, Group, .drop = FALSE) %>%
-  count(.drop = FALSE) %>%
-  filter(n == 0))
+modeldata <- data %>%
+  filter(Location == 'Blood') %>%
+  filter(TimePoint != 'Endpoint') %>%
+  filter(Group != 'WT T-cells or None') %>%
+  filter(Status_Mid != 'Dead') %>%
+  droplevels
+
+mdata <- modeldata %>%
+  group_by(TimePoint, Status_Mid, Group, Experiment) %>%
+  summarise(mCellCount = mean(CellCount, na.rm = TRUE))
+
+modeldata <- left_join(modeldata, mdata)
 ```
 
- 
+Run model
 
+```{r}
+mod <- glmmTMB(CellCount ~ TimePoint*Status_Mid*Group + Experiment*(TimePoint + Status_Mid + Group) + (1|ID),
+              data = modeldata, family = nbinom2)
+
+# glmmTMB::diagnose(mod)
+# resids <- DHARMa::simulateResiduals(mod)
+# plot(resids)
+```
+
+Model predictions
+
+```{r}
+modeldata$pred <- predict(mod, type = 'response', re.form = NA)
+  
+T1_to_T2 <- modeldata %>%
+  ggplot(aes(x = TimePoint, y = CellCount, color = Group)) +
+  geom_errorbar(aes(y = pred, ymin = pred, ymax = pred)) +
+  #geom_errorbar(aes(y = mCellCount, ymin = mCellCount, ymax = mCellCount, color = Group)) +
+  geom_beeswarm(alpha = 0.6) +
+  geom_line(aes(group = ID, color = Group)) +
+  ggh4x::facet_nested(Experiment ~ T1_to_T2 + Group) +
+  scale_y_continuous(trans = 'pseudo_log', breaks = c(0, 10, 100, 1000, 10000, 100000)) +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  theme_bw() +
+  scale_colour_manual(values = c(
+    #rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  labs(y = 'Cells per ml of blood')
+
+ggsave(here("output/T1_to_T2.pdf"), T1_to_T2,
+       device = "pdf",  height = 8, width = 10, dpi=600)
+
+T1_to_T2
+```
+
+Plots are on the log scale, with observed data as dots and model predictions as lines. These lines are the predicted mean of each group. Plotted on the log scale, these tend to look 'too high', especially with right skew data, but are actually correct log transformed means. On the original scale they would look like correct means.
+
+## Contrasts
+
+Output results of contrasts, first without multiple testing adjustment. 
+This corresponds to what Nico asked (treat results of each experiment as fully independent). 
+I would advise against.
+
+```{r}
+emmA <- emmeans(mod, ~ TimePoint | Group*Status_Mid+Experiment, adjust = 'none',
+                at = list(Experiment = 'Experiment A', Status_Mid = 'No tumor'))
+ctrA <- pairs(emmA, type = 'response', reverse = TRUE, infer = TRUE, adjust = 'none')
+
+emmB <- emmeans(mod, ~ TimePoint | Group*Status_Mid+Experiment, at = list(Experiment = 'Experiment B'))
+ctrB <- pairs(emmB, type = 'response', reverse = TRUE, infer = TRUE, adjust = 'none')
+
+emmC <- emmeans(mod, ~ TimePoint | Group*Status_Mid+Experiment, 
+                at = list(Experiment = 'Experiment C', Status_Mid = 'Tumor'))
+ctrC <- pairs(emmC, type = 'response', reverse = TRUE, infer = TRUE, adjust = 'none') 
+
+table_nopadj <- summary(rbind(ctrA, ctrB, ctrC), adjust = 'none') 
+table_nopadj <- table_nopadj %>% as_tibble %>%
+  mutate(`Adj. p-value` = ifelse(p.value < 0.001, "<0.001", round(p.value, 3)) %>% as.character) %>%
+  mutate(across(where(is.numeric)) %>% round(., 3)) %>%
+  select(-null) %>%
+  select(Experiment, Group, Status_Mid, 
+         contrast,
+         `Ratio of Cell Counts` = ratio,
+         `95% CI, lower` = asymp.LCL, 
+         `95% CI, upper` = asymp.UCL,
+         `Adj. p-value`)
+
+knitr::kable(table_nopadj)
+```
+
+Next: same comparisons but with multiple testing adjustment. 
+I recommend these, since all data are in the same model (with an adjustment for experiment). 
+
+```{r}
+table_padj <- summary(rbind(ctrA, ctrB, ctrC), adjust = 'mvt') 
+table_padj <- table_padj %>% as_tibble %>%
+  mutate(`Adj. p-value` = ifelse(p.value < 0.001, "<0.001", round(p.value, 3)) %>% as.character) %>%
+  mutate(across(where(is.numeric)) %>% round(., 3)) %>%
+  select(-null) %>%
+  select(Experiment, Group, Status_Mid, 
+         contrast,
+         `Ratio of Cell Counts` = ratio,
+         `95% CI, lower` = asymp.LCL, 
+         `95% CI, upper` = asymp.UCL,
+         `Adj. p-value`)
+
+knitr::kable(table_padj)
+```
+
+## Methods
+
+To analyse the FACS-based cell-count data, we ran a generalized linear mixed model (GLMM) with a negative binomial error structure and a log link. We ran this count model in R [ref], using the glmmTMB function from the glmmTMB package [ref]. Cell Counts were the outcome variable, while Group (MGAT5 KO vs WT), outcome by the mid timepoint (tumor, no tumor), timepoint (early or mid) with all possible interactions and experiment (donor A, B or C) were the predictors. We added a random intercept for each mouse to model the correlation between the timepoints, as for donor B and C, mice were followed up over time. Summarising, the model formula was: CellCount ~ Group * Status_Mid * TimePoint + Experiment * (Group * Status_Mid * TimePoint) + (1|ID). Model quality was checked with the DHARMa package [ref]. Contrasts to test for cell population contraction by the mid timepoint and for the difference in CellCount in MGAT5 KO vs WT were calculated with the emmeans package [ref], multiplicity adjustment of the type 'mvt' (i.e. single step method). 
+
+# Population contraction/expansion: TP2 -> TP3
+
+To answer this, we will look separately at the mice that have cleared the secondary tumor vs. those that have not. We made a new variable for this (Status_End), based on the survival analysis. 
+This variable captures whether a mouse has died, survived and carries a tumor at TimePoint 3 or survived and does not carry a tumor by timepoint 3.
+
+In this case, we have paired measurements also for experiment A. 
+
+We present the data split up by disease course over the 3 timepoints. 
+
+```{r}
+modeldata <- data %>%
+  filter(Location == 'Blood') %>%
+  filter(TimePoint != 'Early') %>%
+  filter(Group != 'WT T-cells or None') %>%
+  filter(Status_Mid != 'Dead' & Status_End != 'Dead') %>%
+  droplevels
+
+mdata <- modeldata %>%
+  group_by(TimePoint, Status_End, Group, Experiment) %>%
+  summarise(mCellCount = mean(CellCount, na.rm = TRUE))
+
+modeldata <- left_join(modeldata, mdata)
+```
+
+```{r}
+modeldata %>%
+  ggplot(aes(x = TimePoint, y = CellCount, color = Group)) +
+  #geom_errorbar(aes(y = mCellCount, ymin = mCellCount, ymax = mCellCount)) +
+  geom_beeswarm(alpha = 0.6, aes(color = Group)) +
+  geom_line(aes(group = ID)) +
+  ggh4x::facet_nested(Experiment ~ T2_to_T3) +
+  scale_y_continuous(trans = 'pseudo_log', breaks = c(0, 10, 100, 1000, 10000, 100000)) +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  theme_bw() +
+  scale_colour_manual(values = c(
+    #rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  labs(y = 'Cells per ml of blood')
+```
+
+Is it worthwhile analyzing this? There don't seem to be clear trends as opposed to early to mid...
 
 ```{r}
 citation()
-citation('car')
-citation('multcomp')
+citation('tidyverse')
+citation('glmmTMB')
+citation('DHARMa')
+citation('emmeans')
 ```
+
 
