@@ -27,16 +27,21 @@ inv_pseudo_log <- function(x, sigma = 1, base = 10) {
 
 # Description of experiments
 
-Purpose of the experiment is to look at the effect of MGAT5 engineering in CART-cells in a mouse tumor model. The model uses Raji cells, which create blood tumors of the Burkitt lymphoma type. These cells are CD19, CD20 and CD70 positive.  
+Purpose of the experiment is to look at the effect of MGAT5 engineering in CART-cells in a mouse tumor model. The model uses Raji cells, which create blood tumors of the Burkitt's lymphoma type. These cells are CD19, CD20 and CD70 positive.  
 
-The experiment has the following timeline:
+The experiments have appr. the following timelines:
 
-  - day 0: injection of 500 000 Raji cells IV
-  - day 6: IVIS baseline measurement
-  - day 7: treatment (CAR T injection ivin different doses and controls)
-  - around day 135: rechallenge with new dose of Raji cells IV
+  - day -1 or -2: weight baseline measurement 
+  - day 0: injection of Raji cells IV
+  - day 4, 5 or 6: start of weight and IVIS measurements
+  - day: 7 CART cell injection
+  - around day 130: rechallenge if applicable
   
-The mice are followed up via body weight measurements and IVIS data and some blood is taken at several timepoints to count the number of CAR cells (GFP+) in the blood. There are 4 experiments, each with 5 mice per group. 
+Careful; depending on the data source file, the days can be relative to injection of Raji cells, but also relative to the start of the CART cell engineering, which starts typically 6 days earlier. That means that the day of Raji injection would become day 6 and CART cell injection day 13.
+  
+The mice are followed up via body weight measurements and IVIS data and some blood is taken at several timepoints to count the number of CAR cells (GFP+) in the blood. 
+
+There are several experiments: 
 
 Experiment 51:
 
@@ -46,53 +51,80 @@ Experiment 51:
   - CD70 CART MGAT5 4 million cells
   - CD70 CART WT 2 million cells
   - CD70 CART MGAT5 2 million cells
- 
+  - CD20 CART WT 1 million cells
+  - CD20 CART MGAT5 1 million cells
+  - CD20 CART WT 0.5 million cells
+  - CD20 CART MGAT5 0.5 million cells
   
 Experiment 62 and 68:
 
   - NTC: 4 million cells donor T-cells, no CAR T cells
   - CD70 CART WT 4 million cells
   - CD70 CART MGAT5 4 million cells
-
+  - CD20 CART WT 0.5 million cells
+  - CD20 CART MGAT5 0.5 million cells
+  - CD19 CART WT 2 million cells
+  - CD19 CART MGAT5 2 million cells
   
 Experiment 74: used 6 mice per group, and no CD19 CART cells:
 
   - NTC: 4 million cells donor T-cells, no CAR T cells
   - CD70 CART WT 4 million cells
   - CD70 CART MGAT5 4 million cells
- 
-
-Summary: 
-
-  1) The target is CD70
-  2) different doses of CART cells have been injected; 0.5, 2 or 4 million
-  3) CART cells were either engineered or not to have MGAT5 KO
+  - CD20 CART WT 0.5 million cells
+  - CD20 CART MGAT5 0.5 million cells
   
-There was a rechallenge part to experiments 51 and 74, but not to 62 and 68. 
+Experiment 91, 97 and 103:
+
+  - NTC
+  - CD19 CART WT
+  - CD19 CART MGAT5
+
+Summarizing we can say that: 
+
+  1) there are 3 CART targets: CD19, CD20, CD70
+  2) different amounts of CART cells have been injected; 0.5, 2 or 4 million
+  3) CART cells were either engineered or not to have MGAT5 knocked out
+  
+There was a rechallenge part to experiments 51 and 74 but not to 62, 68, 91 and 97. Exp 103 is still running.
 A rechallenge means that tumor cells were administered again after a set period.
+We also note the end-day of the experiments.
+
+Note: for Exp 91, the IVIS machine was unavailable, so it was terminated prematurely.
+Note 2: in the analyses below, the CD20 data is not used. The metadata thus only contains info on the mice that are used. 
 
 ```{r}
+# These are days since tumor inoculation
 day_rechallenge_E51 <- 133
 day_rechallenge_E62 <- NA
 day_rechallenge_E68 <- NA
 day_rechallenge_E74 <- 139
+day_rechallenge_E91 <- NA
+day_rechallenge_E97 <- NA #26/3/26: in fact, there was a rechallenge, but ignored it since too little mice for plots and stats
+day_rechallenge_E103 <- NA #26/3/26: exp still running, rechallenge may or may not happen
 
 day_end_E51 <- 216
 day_end_E62 <- 83
 day_end_E68 <- 88
 day_end_E74 <- 202
+day_end_E91 <- 25
+day_end_E97 <- 137 #26/3/26: did not end on day 137, but decided to use this as end date, since too few mice for rechallenge. 
+day_end_E103 <- 63 #26/3/26: exp still running, end date not final
 ```
 
 # Data
 
 The data are from a flow cytometry experiment which analyzed the number of CART cells in the blood of mice in the Raji tumor model treated with different versions of CAR T-cells or controls. The following variables are in the dataset:
 
-  - Experiment: from which experiment are the data (E51, E62, E68 and E74)
-  - Day: at which day was blood sampled? We have 2 or 4
-   timepoints, depending on the experiment. Around day 20, around day 90, around day 150 and around day 200.
-  - Treatment: mice received no CAR T-cells (PBS, NTC, None), CAR T-cells but no MGAT5 engineering (CD70 nanoCAR-neg and CD70 nanoCAR-WT) or CAR T-cells which were MGAT5 KO (CD70 nanoCAR-MGAT5 KO). Specifically in experiment 51, there was a test for doses of treatment. We will remove those cases where the dose does not correspond to the other experiments. 
-  - CellCount: the number of cells found in a spleen or in 1 ul blood. 
+  - Experiment: from which experiment are the data (E51, E62, E68, E91, E97, E103)
+  - Day_SinceTumorInjectoon: at which day was blood sampled? We have 2 or 4 timepoints, depending on the experiment. Around day 20, around day 90, around day 150 and around day 200.
   - Mouse: refers to the ID of the mouse in the experiment.  
+  - Treatment: mice received no CAR T-cells (PBS, NTC, None), CAR T-cells but no MGAT5 engineering (nanoCAR-neg and nanoCAR-WT) or CAR T-cells which were MGAT5 KO (nanoCAR-MGAT5 KO). Specifically in experiment 51, there was a test for doses of treatment. We will remove those cases where the dose does not correspond to the other experiments.
+  - CellCount_pul: the number of cells found in 1 ul blood. 
+  - TumorPresent: was tumor present at the time of bleeding as evaluated on IVIS?
+  - Remark: any relevant extra information.
+  
+_For all day variables: Still need to clarify whether this is days since T cell isolation, days since tumor injection or still another reference point (e.g. days since CART injection)?_
 
 ```{r}
 data <- read_xlsx(here('data/data_counts_cleaned.xlsx'))
@@ -100,11 +132,13 @@ data <- read_xlsx(here('data/data_counts_cleaned.xlsx'))
 
 Cleaning: remove sentinel mice
 Cleaning: remove 'No Raji' controls
+Cleaning: 3 rows that have missing data for CellCount (due to low counting beads)
 
 ```{r}
 data <- data %>%
   filter(Treatment != 'sentinel') %>%
-  filter(!str_detect(Treatment, 'No Raji'))
+  filter(!str_detect(Treatment, 'No Raji')) %>%
+  filter(!is.na(CellCount_pul))
 ```
 
 Cleaning: remove treatments in exp 51 that were for dose finding and not repeated in other experiments.
@@ -150,7 +184,7 @@ data$Treatment %>% unique
 ```
 
 Make a group variable, indicating no CAR, CAR or CAR with MGAT5 KO.
-Make a target variable, indicating control, CD20 or CD70
+Make a target variable, indicating control, CD19 or CD70
 
 ```{r}
 data <- data %>%
@@ -165,14 +199,16 @@ data <- data %>%
       Treatment %in% c('NTC') ~ 'NTC', 
       Treatment %in% c('CD19 nanoCAR MGAT5 WT', 'CD19 nanoCAR MGAT5 KO') ~ 'CD19',
       Treatment %in% c('CD70 nanoCAR MGAT5 WT', 'CD70 nanoCAR MGAT5 KO') ~ 'CD70')),
+    Day = Day_SinceTumorInoculation,
     TimePoint = factor(case_when(
-      Day < 40 ~ 1, 
-      between(Day, 40, 100) ~ 2,
+      Day < 30 ~ 1, 
+      between(Day, 30, 50) ~ 1.5,
+      between(Day, 50, 100) ~ 2,
       between(Day, 100, 180) ~ 3,
       Day > 180 ~ 4)),
     Experiment = factor(
       Experiment,
-      levels = c('E51', 'E62', 'E68', 'E74', 'E91', 'E97')),
+      levels = c('E51', 'E62', 'E68', 'E74', 'E91', 'E97', 'E103')),
     ID = paste0(Experiment, 'M', Mouse),
     TumorPresent = factor(TumorPresent))
 ```
@@ -185,7 +221,7 @@ data <- data %>%
   mutate(CellCount = (1000*CellCount_pul) %>% round(., 0))
 ```
 
-Add column that indicates whether mice had tumor at secondary timepoint
+Add column that indicates whether mice had tumor at secondary timepoint.
 
 ```{r}
 tftp2 <- data %>%
@@ -265,7 +301,7 @@ data %>%
 ```{r}
 CD19_box <- data %>%
   filter(Target == 'CD19') %>%
-  filter(TimePoint %in% c(1)) %>%
+  filter(TimePoint != 1.5) %>%
   ggplot(aes(x = Group, y = CellCount, color = Group)) +
   geom_boxplot(outlier.shape = NA) +
   geom_jitter(width = 0.2, alpha = 0.5) +
@@ -285,6 +321,9 @@ CD19_box <- data %>%
   scale_y_facet(Experiment == 'E97', 
                 breaks = c(0,100,200,300,400),
                 labels = (c(0,100,200,300,400))^2) +
+  scale_y_facet(Experiment == 'E103', 
+                breaks = c(0,100,200,300,400),
+                labels = (c(0,100,200,300,400))^2) +
   theme(panel.grid.minor = element_blank())
 
 ggsave(here("output/CellCountsBoxplot_CD19_Raji_PerExp_byTimePoint.pdf"), CD19_box,
@@ -298,9 +337,33 @@ Number of mice:
 ```{r}
 data %>%
   filter(Target %in% c('NTC', 'CD19')) %>% 
-  filter(Experiment %in% c('E91', 'E97')) %>%
+  filter(Experiment %in% c('E91', 'E97', 'E103')) %>%
   group_by(TimePoint, Group, Experiment) %>%
   count()
+```
+
+```{r}
+CD19_box_tp1.5 <- data %>%
+  filter(Target == 'CD19') %>%
+  filter(TimePoint == 1.5) %>%
+  ggplot(aes(x = Group, y = CellCount, color = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.5) +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  theme_bw() +
+  scale_colour_manual(values = c(
+    #rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  labs(y = 'Cells per ml of blood') +
+  ggtitle('CD19 nanoCAR, counts of GFP+ cells') +
+  scale_y_continuous(trans = 'sqrt', breaks = c(0, 500, 2000, 5000, 10000, 15000)) +
+  theme(panel.grid.minor = element_blank())
+
+ggsave(here("output/CellCountsBoxplot_CD19_Raji_PerExp_TimePoint_1_5.pdf"), CD19_box_tp1.5,
+       device = "pdf", height = 8, width = 10, dpi=600)
+
+CD19_box_tp1.5
 ```
 
 # Models
@@ -421,7 +484,6 @@ Plots are on the log scale, with observed data as dots and model predictions as 
 ```{r}
 modeldata <- data %>%
   filter(Target %in% c('CD19')) %>%
-  filter(TimePoint %in% c(1)) %>%
   group_by(Target, Experiment, TimePoint) %>%
   nest() %>%
   mutate(data = purrr::map(data, ~.x %>% droplevels()))
@@ -456,6 +518,7 @@ data_aug <- bind_rows(modeldata$data, .id = "ID") %>%
 data_aug <- left_join(data_aug, modeldata %>% select(ID, Experiment, Target, TimePoint))
   
 BloodPlots <- data_aug %>%
+  filter(TimePoint != 1.5) %>%
   ggplot(aes(x = Group, y = CellCount, color = Group)) +
   geom_errorbar(aes(y = pred, color = Group, ymin = pred, ymax = pred)) +
   geom_jitter(alpha = 0.4, width = 0.2) +
@@ -475,6 +538,9 @@ BloodPlots <- data_aug %>%
                 limits = c(0, 500),
                 breaks = c(0,100,200,300,400),
                 labels = (c(0,100,200,300,400))^2) +
+  scale_y_facet(Experiment == 'E103', 
+                breaks = c(0,100,200,300,400),
+                labels = (c(0,100,200,300,400))^2)
   labs(y = 'Cells per ml of blood')
 
 BloodPlots
@@ -486,9 +552,33 @@ ggsave(here("output/CellCountMedianPlots_CD19_Raji_PerExp_byTimePoint.pdf"), Blo
 
 Plots are on the log scale, with observed data as dots and model predictions as lines. These lines are the predicted mean of each group. Plotted on the log scale, these tend to look 'too high', especially with right skew data, but are actually correct log transformed means. On the original scale they would look like correct means.
 
+```{r}
+BloodPlots_tp1_5 <- data_aug %>%
+  filter(TimePoint == 1.5) %>%
+  ggplot(aes(x = Group, y = CellCount, color = Group)) +
+  geom_errorbar(aes(y = pred, color = Group, ymin = pred, ymax = pred)) +
+  geom_jitter(alpha = 0.4, width = 0.2) +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  scale_y_continuous(trans = 'sqrt', 
+                     breaks = c(1000, 3000, 6000, 10000, 15000)) +
+  theme_bw() +
+  scale_colour_manual(values = c(
+    #rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255))) +
+  labs(y = 'Cells per ml of blood')
+
+BloodPlots_tp1_5
+
+ggsave(here("output/CellCountMedianPlots_CD19_Raji_PerExp_TimePoint_1_5.pdf"), BloodPlots_tp1_5,
+       device = "pdf", height = 6, width = 6, dpi=600)
+
+```
+
+
 # Materials and Methods
 
-To analyse the FACS-based cell-count data of 4 separate experiments (i.e. donors), we ran separate models for each combination of target (CD20 and CD70), donor and time-point (1, 2). Note that we did not always have data for all settings available. 
+To analyse the FACS-based cell-count data of 4 separate experiments (i.e. donors), we ran separate models for each combination of target (CD20 and CD70), donor and time-point. Note that we did not always have data for all settings available. 
 
 We ran quasipoisson models in R [ref], using the glm function with Cell Counts per ml of blood as the outcome variable and Group (MGAT5KO vs WT) as predictor. The presented p-values were then extracted from the model.
 

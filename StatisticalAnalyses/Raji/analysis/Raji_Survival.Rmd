@@ -18,18 +18,20 @@ library(ggsurvfit)
 library(gtsummary)
 ```
 
-# Description of experiments
-
 Purpose of the experiment is to look at the effect of MGAT5 engineering in CART-cells in a mouse tumor model. The model uses Raji cells, which create blood tumors of the Burkitt's lymphoma type. These cells are CD19, CD20 and CD70 positive.  
 
-The experiment has the following timeline:
+The experiments have appr. the following timelines:
 
-  - day 0: injection of 500 000 Raji cells IV
-  - around day 6: IVIS baseline measurement
-  - around day 7: treatment (CAR T injection ivin different doses and controls)
-  - around day 133: rechallenge in some targets
+  - day -1 or -2: weight baseline measurement 
+  - day 0: injection of Raji cells IV
+  - day 4, 5 or 6: start of weight and IVIS measurements
+  - day: 7 CART cell injection
+  - around day 130: rechallenge if applicable
   
-The mice are followed up via body weight measurements and IVIS data, which measures luminescence of the Raji cells in the mice. IVIS measurements are taken at set days (every 3 or 4 days) and mice weights are recorded every 2 days. There are 4 experiments, each with 5 mice per group. 
+Careful; depending on the data source file, the days can be relative to injection of Raji cells, but also relative to the start of the CART cell engineering, which starts typically 6 days earlier. That means that the day of Raji injection would become day 6 and CART cell injection day 13.
+  
+The mice are followed up via body weight measurements and IVIS data, which measures luminescence of the Raji cells in the mice. 
+There are several experiments: 
 
 Experiment 51:
 
@@ -39,50 +41,65 @@ Experiment 51:
   - CD70 CART MGAT5 4 million cells
   - CD70 CART WT 2 million cells
   - CD70 CART MGAT5 2 million cells
+  - CD20 CART WT 1 million cells
+  - CD20 CART MGAT5 1 million cells
+  - CD20 CART WT 0.5 million cells
+  - CD20 CART MGAT5 0.5 million cells
   
 Experiment 62 and 68:
 
   - NTC: 4 million cells donor T-cells, no CAR T cells
   - CD70 CART WT 4 million cells
   - CD70 CART MGAT5 4 million cells
-
+  - CD20 CART WT 0.5 million cells
+  - CD20 CART MGAT5 0.5 million cells
+  - CD19 CART WT 2 million cells
+  - CD19 CART MGAT5 2 million cells
   
 Experiment 74: used 6 mice per group, and no CD19 CART cells:
 
   - NTC: 4 million cells donor T-cells, no CAR T cells
   - CD70 CART WT 4 million cells
   - CD70 CART MGAT5 4 million cells
+  - CD20 CART WT 0.5 million cells
+  - CD20 CART MGAT5 0.5 million cells
+  
+Experiment 91, 97 and 103:
 
-Experiment 91 and 97
-
-  - NTC 
+  - NTC
   - CD19 CART WT
   - CD19 CART MGAT5
-  
+
 Summarizing we can say that: 
 
   1) there are 3 CART targets: CD19, CD20, CD70
   2) different amounts of CART cells have been injected; 0.5, 2 or 4 million
   3) CART cells were either engineered or not to have MGAT5 knocked out
   
-There was a rechallenge part to experiments 51 and 74, but not to 62 and 68. No data yet on exp 91 or 97, experiments still running. A rechallenge means that tumor cells were administered again after a set period.
+There was a rechallenge part to experiments 51 and 74 but not to 62, 68, 91 and 97. Exp 103 is still running.
+A rechallenge means that tumor cells were administered again after a set period.
 We also note the end-day of the experiments, as we need this for calculations of the survival times.
-Experiment 91 and 97 are still running, so no end days yet there either. To allow calculations, we set it to the last known day.  
+
+Note: for Exp 91, the IVIS machine was unavailable, so it was terminated prematurely.
+Note 2: in the analyses below, the CD20 data is not used. The metadata thus only contains info on the mice that are used. 
 
 ```{r}
+# These are days since tumor inoculation
 day_rechallenge_E51 <- 133
 day_rechallenge_E62 <- NA
 day_rechallenge_E68 <- NA
 day_rechallenge_E74 <- 139
 day_rechallenge_E91 <- NA
-day_rechallenge_E97 <- NA
+day_rechallenge_E97 <- NA #26/3/26: in fact, there was a rechallenge, but ignored it since too little mice for plots and stats
+day_rechallenge_E103 <- NA #26/3/26: exp still running, rechallenge may or may not happen
 
-day_end_E51 <- 215
+day_end_E51 <- 216
 day_end_E62 <- 83
 day_end_E68 <- 88
 day_end_E74 <- 202
 day_end_E91 <- 25
-day_end_E97 <- 74
+day_end_E97 <- 137 #26/3/26: did not end on day 137, but decided to use this as end date, since too few mice for rechallenge. 
+day_end_E103 <- 63 #26/3/26: exp still running, end date not final
 ```
 
 The question we want to answer are:
@@ -111,31 +128,29 @@ Survival <- left_join(Survival, metadata)
 In the survival data; 
 
   - Event1: event during primary challenge
-    - 0 = mouse did not experience an event
+    - 0 = mouse did not experience an event or was censored (e.g. due to bleeding for ex-vivo cell culture)
     - 1 = mouse died of tumor
     - 2 = mouse died of other cause (unknown, GVHD, ...)
     
   - Event2: event during rechallenge, only for mice that survived primary challenge. 
-    - 0 = mouse did not experience an event
+    - 0 = mouse did not experience an event or was censored (e.g. due to bleeding for ex-vivo cell culture)
     - 1 = mouse died of tumor
     - 2 = mouse died of other cause (unknown, GVHD, ...)
 
 ## Weight data
-Get the bodyweight data for each experiment,
-Put in long format,
-Combine data from 6 experiments into one large dataframe,
-Remove lines with missing weight data
-Select relevant columns and sort
+Get the bodyweight data for each experiment. This is to calculate survival times.
+Put in long format, combine data from 6 experiments into one large dataframe. Remove lines with missing weight data, select relevant columns and sort.
 
 ```{r}
 Weight <- datalist[str_detect(names(datalist), 'Weight')] %>% # select only weight data
   map(~ pivot_longer(.x, 
-                     cols = -Day,
+                     cols = -Day_SinceTumorInoculation,
                      names_to = 'Mouse',
                      values_to= 'Weight')) %>%
   bind_rows(.id = 'Experiment') %>%
   mutate(Experiment = str_remove(Experiment, 'Weight'),
-         Mouse = as.numeric(Mouse)) %>%
+         Mouse = as.numeric(Mouse), 
+         Day = Day_SinceTumorInoculation) %>%
   filter(!is.na(Weight)) %>%
   select(Experiment, Mouse, Day, Weight) %>%
   arrange(Experiment, Mouse, Day)
@@ -143,11 +158,11 @@ Weight <- datalist[str_detect(names(datalist), 'Weight')] %>% # select only weig
 Weight <- left_join(Weight, Survival) %>%
   mutate(GVHD = ifelse(is.na(GVHD), 'No or unknown', GVHD),
          Event1 = factor(Event1, 
-                        labels = c('Survived', 
+                        labels = c('Survived or censored', 
                                    'Died of tumor', 
                                    'Died of other cause')),
          Event2 = factor(Event2, 
-                        labels = c('Survived', 
+                        labels = c('Survived or censored', 
                                    'Died of tumor', 
                                    'Died of other cause')))
 ```
@@ -185,13 +200,33 @@ Weight <- Weight %>%
   filter(!(Mouse == 21 & Experiment == 'E51')) %>%
   filter(!(Mouse %in% c(1,22,38,39,40,41,42,43) & Experiment == 'E68')) %>%
   filter(!(Mouse %in% c(22,29,30,46,47) & Experiment == 'E74')) %>%
+  filter(!is.na(Treatment)) %>%
+  filter(Dose %in% c(0,4) | is.na(Dose)) %>%
   arrange(Experiment, Mouse, Day) %>%
-  mutate(Experiment = factor(Experiment), 
+  mutate(Experiment = factor(Experiment, levels = c('E51', 'E62', 'E68', 'E74',
+                                                    'E91', 'E97', 'E103')), 
          ID = fct_inorder(paste0(Experiment, 'M', Mouse)), 
          Treatment = factor(Treatment), 
          Target = factor(Target, levels =c('Ctrl', 'CD70', 'CD19')), 
          MGAT5 = factor(MGAT5, levels = c('Ctrl', 'MGAT5WT', 'MGAT5KO')),
-         Dose = factor(Dose, levels = c('0','1','0.5','2','4'))) %>%
+         Day_Rechallenge = case_when(
+           Experiment == 'E51' ~ day_rechallenge_E51,
+           Experiment == 'E62' ~ day_rechallenge_E62,
+           Experiment == 'E68' ~ day_rechallenge_E68,
+           Experiment == 'E74' ~ day_rechallenge_E74,
+           Experiment == 'E91' ~ day_rechallenge_E91,
+           Experiment == 'E97' ~ day_rechallenge_E97,
+           Experiment == 'E103' ~ day_rechallenge_E103),
+         Day_End = case_when(
+           Experiment == 'E51' ~ day_end_E51,
+           Experiment == 'E62' ~ day_end_E62,
+           Experiment == 'E68' ~ day_end_E68,
+           Experiment == 'E74' ~ day_end_E74,
+           Experiment == 'E91' ~ day_end_E91,
+           Experiment == 'E97' ~ day_end_E97,
+           Experiment == 'E103' ~ day_end_E103), 
+         Day_SinceTumorInoculation = Day,
+         Day_SinceTCellIsolation = Day + 6) %>%
   select(Experiment, Mouse, ID, everything())
 
 Survival <- Survival %>%
@@ -199,13 +234,15 @@ Survival <- Survival %>%
   filter(!(Mouse == 21 & Experiment == 'E51')) %>%
   filter(!(Mouse %in% c(1,22,38,39,40,41,42,43) & Experiment == 'E68')) %>%
   filter(!(Mouse %in% c(22,29,30,46,47) & Experiment == 'E74')) %>%
+  filter(!is.na(Treatment)) %>%
+  filter(Dose %in% c(0,4) | is.na(Dose)) %>%
   arrange(Experiment, Mouse) %>%
-  mutate(Experiment = factor(Experiment), 
+  mutate(Experiment = factor(Experiment, levels = c('E51', 'E62', 'E68', 'E74',
+                                                    'E91', 'E97', 'E103')), 
          ID = fct_inorder(paste0(Experiment, 'M', Mouse)), 
          Treatment = factor(Treatment), 
          Target = factor(Target, levels =c('Ctrl', 'CD70', 'CD19')), 
-         MGAT5 = factor(MGAT5, levels = c('Ctrl', 'MGAT5WT', 'MGAT5KO')),
-         Dose = factor(Dose, levels = c('0','0.5','1','2','4'))) %>%
+         MGAT5 = factor(MGAT5, levels = c('Ctrl', 'MGAT5WT', 'MGAT5KO'))) %>%
   select(Experiment, Mouse, ID, everything())
 ```
 
@@ -218,36 +255,18 @@ We have follow up times for:
 FUtimes_1 <- Weight %>%
   group_by(Experiment, ID) %>%
   filter(Day == max(Day)) %>%
-  select(Experiment, ID, Day) %>%
-  mutate(Time_FU_1 = case_when(
-    Experiment == 'E51' ~ pmin(Day, day_rechallenge_E51),
-    Experiment %in% c('E62', 'E68') ~ Day,
-    Experiment == 'E74' ~ pmin(Day, day_rechallenge_E74), 
-    Experiment == 'E91' ~ pmin(Day, day_rechallenge_E91, na.rm = TRUE),
-    Experiment == 'E97' ~ pmin(Day, day_rechallenge_E97, na.rm = TRUE)
-  )) %>% 
-  select(-Day)
+  mutate(Time_FU_1 = pmin(Day, Day_Rechallenge, Day_End, na.rm = TRUE)) %>%
+  select(Experiment, ID, Time_FU_1)
 
 FUtimes_2 <- Weight %>%
   group_by(Experiment, ID) %>%
   filter(Day == max(Day)) %>%
-  select(Experiment, ID, Day) %>%
-  mutate(Time_FU_2 = case_when(
-    Experiment == 'E51' ~ pmin(Day, day_end_E51),
-    Experiment == 'E62' ~ NA,
-    Experiment == 'E68' ~ NA,
-    Experiment == 'E74' ~ pmin(Day, day_end_E74),
-    Experiment == 'E91' ~ pmin(Day, day_end_E91, na.rm = TRUE),
-    Experiment == 'E97' ~ pmin(Day, day_end_E97, na.rm = TRUE)
-  )) %>% 
-  select(-Day)
+  mutate(Time_FU_2 = pmin(Day, Day_End, na.rm = TRUE)) %>%
+  select(Experiment, ID, Time_FU_2)
 
 Survival <- left_join(Survival, FUtimes_1)
 Survival <- left_join(Survival, FUtimes_2)
 rm(Weight, FUtimes_1, FUtimes_2)
-
-Survival <- Survival %>% 
-  filter(!is.na(Target))
 ```
 
 Write datasheets to xlsx files for later reference
@@ -267,12 +286,13 @@ Some data QC
 ## Primary tumor, per experiment 
 
 We check how many mice died of the tumor in each treatment setting. 
-First, we filter out all mice for which the cause of death was unknown, GVHD, etc (i.e. not the tumor) during the first challenge.
+First, we filter out all mice for which the cause of death was not the tumor during the first challenge.
+I.e. event type = 2.
 
 ```{r}
 tableall_70 <- Survival %>%
-  filter(is.na(CauseOfDeath1)) %>%
-  filter(!Experiment %in% c('E91', 'E97')) %>%
+  filter(Event1 != 2) %>%
+  filter(Experiment %in% c('E51', 'E62','E68', 'E74')) %>%
   filter(Target %in% c('CD70', 'Ctrl')) %>%
   group_by(Experiment, Target, Dose, MGAT5, Treatment) %>%
   summarise(Total = n(), 
@@ -286,8 +306,8 @@ tableall_70 %>% writexl::write_xlsx(here("output/SurvivalTable_CD70_Raji_Primary
 tableall_70
   
 tableall_19 <- Survival %>%
-  filter(is.na(CauseOfDeath1)) %>%
-  filter(Experiment %in% c('E91', 'E97')) %>%
+  filter(Event1 != 2) %>%
+  filter(Experiment %in% c('E91', 'E97', 'E103')) %>%
   filter(Target %in% c('CD19', 'Ctrl')) %>%
   group_by(Experiment, Target, MGAT5, Treatment) %>%
   summarise(Total = n(), 
@@ -319,49 +339,42 @@ Survival <- Survival %>%
 
 CD70 <- Survival %>%
   filter((Target == 'CD70' & Dose == '4') | 
-           (Target == 'Ctrl' & Dose == '4')) %>%
+           (Target == 'Ctrl' & Experiment %in% c('E51', 'E62','E68', 'E74') & Dose == '4')) %>%
   filter(Event %in% c('0', '1'))
 
 surv_CD70 <- Surv(CD70$Time_FU, CD70$Event)
 
-simple_palette_CD70= c(
-    rgb(44,20,83, maxColorValue = 255), 
-    rgb(251,79,6, maxColorValue = 255),
-    rgb(14,111,124, maxColorValue = 255)
-    )
-stratify_palette_CD70 = c(
-    rgb(44,20,83, maxColorValue = 255), 
-    rgb(14,111,124, maxColorValue = 255),
-    rgb(251,79,6, maxColorValue = 255))
-
 CD19 <- Survival %>%
   filter((Target == 'CD19') | 
-           (Target == 'Ctrl' & Experiment %in% c('E91', 'E97'))) %>%
+           (Target == 'Ctrl' & Experiment %in% c('E91', 'E97', 'E103'))) %>%
   filter(Event %in% c('0', '1'))
 
 surv_CD19 <- Surv(CD19$Time_FU, CD19$Event)
 
-simple_palette_CD19= c(
+simple_palette = c(
+    rgb(44,20,83, maxColorValue = 255), 
+    rgb(14,111,124, maxColorValue = 255),
+    rgb(251,79,6, maxColorValue = 255)
+    
+    )
+stratify_palette = c(
     rgb(44,20,83, maxColorValue = 255), 
     rgb(251,79,6, maxColorValue = 255),
     rgb(14,111,124, maxColorValue = 255)
     )
-stratify_palette_CD19 = c(
-    rgb(44,20,83, maxColorValue = 255), 
-    rgb(14,111,124, maxColorValue = 255),
-    rgb(251,79,6, maxColorValue = 255))
 
+?Surv
 ```
 
 ## CD70
 
 ```{r}
 sCD70 <- survfit2(surv_CD70 ~ MGAT5, data = CD70)
-CD70_combi <- ggsurvplot(sCD70, data = CD70, palette = simple_palette_CD70, 
+CD70_combi <- ggsurvplot(sCD70, data = CD70, palette = simple_palette, 
                          legend.labs = c('Control', 'MGAT5 WT', 'MGAT5 KO'),
                          xlim = c(0,180))
 CD70_perexp <- ggsurvplot_facet(sCD70, facet.by = 'Experiment', data = CD70, 
-                                palette = stratify_palette_CD70, 
+                                palette = stratify_palette, 
                                 xlim = c(0,180))
 
 CD70_combi$plot <- CD70_combi$plot 
@@ -369,10 +382,10 @@ CD70_combi$plot <- CD70_combi$plot
 CD70_perexp <- CD70_perexp 
   
 ggsave(here('output/SurvivalPlot_CD70_Raji_allExp_primary.pdf'), CD70_combi$plot, 
-       device = 'pdf', width  = 8, height = 5, )
+       device = 'pdf', width  = 8, height = 5)
 
 ggsave(here('output/SurvivalPlot_CD70_Raji_perExp_primary.pdf'), CD70_perexp, 
-       device = 'pdf', width = 8, height = 5, units = mm)
+       device = 'pdf', width = 8, height = 5)
 
 CD70_combi
 CD70_perexp
@@ -390,24 +403,22 @@ CD70 %>%
 
 ```{r}
 sCD19 <- survfit2(surv_CD19 ~ MGAT5, data = CD19)
-CD19_combi <- ggsurvplot(sCD19, data = CD19, palette = simple_palette_CD19, 
-                         legend.labs = c('Control', 'MGAT5 WT', 'MGAT5 KO'))
+CD19_combi <- ggsurvplot(sCD19, data = CD19, palette = simple_palette, 
+                         legend.labs = c('Control', 'MGAT5 WT', 'MGAT5 KO'), 
+                         xlim = c(0,150))
 CD19_perexp <- ggsurvplot_facet(sCD19, facet.by = 'Experiment', data = CD19, 
-                                palette = stratify_palette_CD19)
+                                palette = stratify_palette,
+                                xlim = c(0,150))
 
 CD19_combi$plot <- CD19_combi$plot 
 
-CD19_perexp <- CD19_perexp +
-  xlab('') +
-  ylab('') +
-  theme(legend.position = 'none',
-        strip.text = element_blank())
+CD19_perexp <- CD19_perexp 
 
 ggsave(here('output/SurvivalPlot_CD19_Raji_allExp_primary.pdf'), CD19_combi$plot, 
        device = 'pdf', width  = 8, height = 5)
 
 ggsave(here('output/SurvivalPlot_CD19_Raji_perExp_primary.pdf'), CD19_perexp, 
-       device = 'pdf', width = 86*2, height = 25*2, units = 'mm')
+       device = 'pdf', width = 8, height = 5)
 
 CD19_combi
 CD19_perexp
