@@ -546,8 +546,7 @@ BloodPlots <- data_aug %>%
 BloodPlots
 
 ggsave(here("output/CellCountMedianPlots_CD19_Raji_PerExp_byTimePoint.pdf"), BloodPlots,
-       device = "pdf", height = 6, width = 6, dpi=600)
-
+       device = "pdf", height = 5, width = 10, dpi=600)
 ```
 
 Plots are on the log scale, with observed data as dots and model predictions as lines. These lines are the predicted mean of each group. Plotted on the log scale, these tend to look 'too high', especially with right skew data, but are actually correct log transformed means. On the original scale they would look like correct means.
